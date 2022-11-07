@@ -1,7 +1,8 @@
 use crate::collector::Collector;
+use crate::gc::WeakGc;
 
 pub trait Trace: Send + Sync {
-    fn trace(&self, _: &mut Collector) {}
+    fn trace(&self, root: &dyn WeakGc, c: &mut Collector) {}
     fn release(&self, _: &mut Collector) {}
 }
 

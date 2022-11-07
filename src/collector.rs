@@ -2,26 +2,107 @@ use crate::trace::Trace;
 use crate::gc::{Gc, WeakGc};
 
 use std::cell::RefCell;
+use std::mem;
 use std::sync::{Arc, Weak, Mutex, RwLock, Barrier};
 // TODO: see if crossbeam mpmc is faster than std mpsc?
 use std::sync::mpsc::{Sender, Receiver, sync_channel, SyncSender};
 use std::thread::JoinHandle;
 
-use im::HashSet;
+use std::collections::{HashSet, HashMap};
 
 #[derive(Default)]
 pub struct Collector {
     deferred: HashSet<Box<dyn WeakGc + 'static>>,
+    pub visited: HashMap<usize, (usize, usize)>, // ptr -> (starting strong count, incoming edges)
+}
+
+// Note [Defer List]
+// When a Gc<T> is dropped, it either has a `strong_count` of 1 or >1. If it is
+// simply 1, then we know that we were the last live reference to the object, and
+// thus it isn't part of a cycle. If it is >1, then it *may* be part of a cycle.
+//
+// In the case it *may* be part of a cycle, we create a Weak<T> reference to the
+// internal Arc<T> item, and store that Weak reference on the "defer list" of
+// a collector object. We then occasionally scan all the items on the defer list
+// from another thread via [Cycle Collection], and if we see that the objects
+// are *definitely* unreachable from mutator thread still, we break cyclic
+// references and cause the items to be deallocated.
+//
+// If the object has a count of 1, we can do another optimization as well: we
+// can inspect the `weak_count` of the item, and if its >0 then it has a currently
+// alive Weak<T> reference, which is almost definitely a reference held by the
+// defer list. We optimistically try to *remove* the item from the defer list then,
+// in the hopes that we are able to remove the Weak reference before the collector
+// needs to scan and tell its dead itself, and allow the item to be fully deallocated
+// sooner.
+
+// Note [Cycle Collection]
+// When doing a collection, we visit every item reachable from the roots,
+// initializing them in a scratch space with an initial value of `strong_count`
+// and decrementing the value every time we see a strong reference to the item,
+// along with building a graph of edges for reachability.
+// If, after we're done visiting the roots, we have a scratch space of items
+// forming a strongly connected component, all with a value=0, then we know that
+// all of the strong references to an item are internal to our visited graph;
+// this means that it is a leaked cycle of objects, because if there were any
+// live references from a mutator into the graph it would have a strong reference
+// we weren't able to find.
+
+impl PartialEq for Box<dyn WeakGc + 'static> {
+    fn eq(&self, rhs: &Self) -> bool {
+        self.as_ptr() == rhs.as_ptr()
+    }
+}
+
+impl Eq for Box<dyn WeakGc + 'static> {
+}
+
+impl core::hash::Hash for Box<dyn WeakGc + 'static> {
+    fn hash<H>(&self, hasher: &mut H) where H: core::hash::Hasher {
+        hasher.write_usize(self.as_ptr())
+    }
 }
 
 impl Collector {
     fn collect(&mut self) {
-        // Snapshot the current set of possible cycle roots
-        let snapshot = self.deferred.clone();
         // Create a local scratchpad for visited GC items
+        let visited = HashSet::<usize>::new();
+        let mut deferred = Default::default();
+        mem::swap(&mut self.deferred, &mut deferred);
+        // Visit all the possibly-unreachable cycle roots
+        let mut queue = deferred.iter().collect::<Vec<_>>();
+        while let Some(item) = queue.pop() {
+            self.add_node(&**item);
+            println!("collection visiting 0x{:x}", item.as_ptr());
+            let x = item.visit(self);
+        }
+        mem::swap(&mut self.deferred, &mut deferred);
+        // Now we break cycles from our roots using the [Cycle Collection]
+        // scheme while taking care to handle [Graph Tearing]
+        for (node, (count, incoming)) in self.visited.iter() {
+            println!("{:x}:{}:{}", node, count, incoming);
+        }
+        self.visited = Default::default();
     }
 
-    pub fn visit(&mut self, item: &dyn Trace) {
+    //pub fn visit(&mut self, item: &dyn Trace) {
+    //    // If we have a Gc<T>, insert a Weak<T> of it into our graph along with
+    //    // a self.prev->item edge.
+    //    // Else just add the items 
+    //    *self.working.entry(item as *const dyn Trace as *const () as usize).or_insert_with(
+    //        || item.
+    //    ) += 1;
+    //}
+
+    pub fn add_node(&mut self, root: &dyn WeakGc) {
+        println!("got new node {:x}", root.as_ptr());
+        self.visited.entry(root.as_ptr()).or_insert_with(|| (root.strong_count(), 0) );
+        self.deferred.insert(root.root());
+    }
+
+    pub fn add_edge(&mut self, root: &dyn WeakGc, item: &dyn WeakGc) {
+        println!("got edge {:x}->{:x}", root.as_ptr(), item.as_ptr());
+        self.visited.entry(root.as_ptr()).and_modify(|e| e.1 += 1 ).or_insert_with(|| panic!() );
     }
 
     fn process(&mut self) {
@@ -32,8 +113,8 @@ impl Collector {
                 Soul::Died(d) => {
                     match d.as_ptr() {
                         // We could've been given a Weak<T> that has since been dropped
-                        None => (),
-                        Some(ptr) => {
+                        0 => (),
+                        ptr => {
                             println!("got possibly-cyclic object 0x{:x}", ptr);
                             self.deferred.insert(d);
                         }
@@ -45,6 +126,7 @@ impl Collector {
                 },
                 Soul::Yuga(b) => {
                     println!("triggering yuga");
+                    self.collect();
                     b.wait();
                 }
                 _ => {}
@@ -66,6 +148,7 @@ impl Collector {
         let b = Arc::new(Barrier::new(2));
         LOCAL_SENDER.with(|l| l.send(Soul::Yuga(b.clone())) ).unwrap();
         b.wait();
+        println!("collection done");
     }
 }
 
