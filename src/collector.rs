@@ -3,16 +3,26 @@ use crate::gc::{Gc, WeakGc};
 
 use std::cell::RefCell;
 use std::mem;
+use std::rc::Rc;
 use std::sync::{Arc, Weak, Mutex, RwLock, Condvar};
 // TODO: see if crossbeam mpmc is faster than std mpsc?
 use std::sync::mpsc::{Sender, Receiver, sync_channel, SyncSender};
 use std::thread::JoinHandle;
+use core::marker::PhantomData;
 
-use std::collections::{HashSet, HashMap};
+use im::{HashSet, HashMap, OrdSet, OrdMap};
+
+struct Root<'a>(Rc<dyn WeakGc>, PhantomData<&'a ()>);
+
+impl<'a> Clone for Root<'a> {
+    fn clone(&self) -> Self {
+        Root(self.0.clone(), PhantomData)
+    }
+}
 
 #[derive(Default)]
-pub struct Collector {
-    deferred: HashSet<Box<dyn WeakGc + 'static>>,
+pub struct Collector<'a> {
+    deferred: OrdMap<usize, Root<'a>>,
     pub visited: HashMap<usize, (usize, usize)>, // ptr -> (starting strong count, incoming edges)
 }
 
@@ -48,47 +58,85 @@ pub struct Collector {
 // live references from a mutator into the graph it would have a strong reference
 // we weren't able to find.
 
-impl PartialEq for Box<dyn WeakGc + 'static> {
+impl<'a> PartialEq for Root<'a> {
     fn eq(&self, rhs: &Self) -> bool {
-        self.as_ptr() == rhs.as_ptr()
+        self.0.as_ptr() == rhs.0.as_ptr()
     }
 }
 
-impl Eq for Box<dyn WeakGc + 'static> {
+impl<'a> Eq for Root<'a> {
 }
 
-impl core::hash::Hash for Box<dyn WeakGc + 'static> {
+impl<'a> core::hash::Hash for Root<'a> {
     fn hash<H>(&self, hasher: &mut H) where H: core::hash::Hasher {
-        hasher.write_usize(self.as_ptr())
+        hasher.write_usize(self.0.as_ptr())
     }
 }
 
-impl Collector {
+impl<'a> PartialOrd for Root<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0.as_ptr().partial_cmp(&self.0.as_ptr())
+    }
+}
+
+impl<'a> Ord for Root<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.as_ptr().cmp(&self.0.as_ptr())
+    }
+}
+
+impl<'a> Collector<'a> {
     fn collect(&mut self) {
         // Create a local scratchpad for visited GC items
-        let visited = HashSet::<usize>::new();
-        let mut deferred = Default::default();
-        mem::swap(&mut self.deferred, &mut deferred);
+        let mut visited = OrdMap::new();
         // Visit all the possibly-unreachable cycle roots
-        let mut queue = deferred.iter().collect::<Vec<_>>();
-        while let Some(item) = queue.pop() {
-            self.add_node(&**item);
-            println!("collection visiting 0x{:x}", item.as_ptr());
-            let x = item.visit(self);
+        loop {
+            // Visit all the items in the list that we haven't already visited
+            let snap = self.deferred.clone();
+            for item in visited.diff(&snap) {
+                let item = match item {
+                    im::ordmap::DiffItem::Add(_, item) => item,
+                    im::ordmap::DiffItem::Update { old, new } => new.1,
+                    im::ordmap::DiffItem::Remove(o, i) => { println!("REMOVED"); i },
+                };
+                //let im::ordmap::DiffItem::Add(_, item) = item else { continue };
+                self.add_node(&*item.0);
+                println!("collection visiting 0x{:x}", item.0.as_ptr());
+                let x = item.0.visit(self);
+                // do something with x
+            }
+            visited = snap;
+            if self.deferred.len() == visited.len() {
+                // we didn't add any new items, and we're done
+                break
+            }
         }
-        mem::swap(&mut self.deferred, &mut deferred);
         // Now we break cycles from our roots using the [Cycle Collection]
         // scheme while taking care to handle [Graph Tearing]
         for (node, (count, incoming)) in self.visited.iter() {
-            println!("{:x}:{}:{}", node, count, incoming);
+            let gc = self.deferred.get(node).expect(format!("{:x}", node).as_str());
+            println!("{:x}:{}:{} ({:?})", node, count, incoming,
+                gc.0.flags().unwrap());
+            gc.0.clear_visited();
         }
         self.visited = Default::default();
+        self.deferred = Default::default();
     }
 
-    pub fn add_node(&mut self, root: &dyn WeakGc) {
-        println!("got new node {:x}", root.as_ptr());
-        self.visited.entry(root.as_ptr()).or_insert_with(|| (root.strong_count(), 0) );
-        self.deferred.insert(root.root());
+    pub fn add_node(&mut self, root: &dyn WeakGc) -> bool {
+        let mut novel = false;
+        self.visited.entry(root.as_ptr()).or_insert_with(|| {
+            println!("got new node {:x}", root.as_ptr());
+            root.mark_visited();
+            // we have to add the root to the list somewhere - this is kinda stupid
+            // because we may already have it in the 
+            self.deferred.entry(root.as_ptr()).or_insert_with(|| {
+                Root(root.realloc(), PhantomData)
+            });
+            novel = true;
+            (root.strong_count(), 0)
+        });
+        novel
     }
 
     pub fn add_edge(&mut self, root: &dyn WeakGc, item: &dyn WeakGc) {
@@ -107,7 +155,10 @@ impl Collector {
                         0 => (),
                         ptr => {
                             println!("got possibly-cyclic object 0x{:x}", ptr);
-                            self.deferred.insert(d);
+                            self.deferred.entry(d.as_ptr()).or_insert_with(|| {
+                                println!("inserting");
+                                Root(d.realloc(), PhantomData)
+                            });
                         }
                     }
                 },

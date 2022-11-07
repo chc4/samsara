@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 use std::sync::mpsc::TrySendError;
+use std::rc::Rc;
 
 pub struct Gc<T: Trace + 'static> {
     // The item needs an Option so we can null out objects to break cycles,
@@ -21,6 +22,10 @@ pub trait WeakGc: Send {
     fn as_ptr(&self) -> usize;
     fn strong_count(&self) -> usize;
     fn root(&self) -> Box<dyn WeakGc>;
+    fn clear_visited(&self);
+    fn mark_visited(&self);
+    fn flags(&self) -> Option<GcFlags>;
+    fn realloc(&self) -> std::rc::Rc<dyn WeakGc>;
 }
 impl<T: Trace + 'static> WeakGc for Weak<(Option<RwLock<T>>, AtomicUsize)> {
     // We have a set of WeakGc objects from our defer list
@@ -51,7 +56,6 @@ impl<T: Trace + 'static> WeakGc for Weak<(Option<RwLock<T>>, AtomicUsize)> {
             // We were able to acquire a read-lock, so we know it doesn't have a
             // write-lock outstanding; we now mark it as VISITED and then acquire
             // the strong count to handle [Graph Tearing]
-            upgraded.1.store(GcFlags::VISITED.bits(), Ordering::Release);
             let strong_count = self.strong_count();
             let ptr = self.as_ptr() as usize;
             // This object is definitely already in the graph; either we are visiting
@@ -78,8 +82,24 @@ impl<T: Trace + 'static> WeakGc for Weak<(Option<RwLock<T>>, AtomicUsize)> {
         self.strong_count()
     }
 
+    fn mark_visited(&self) {
+        self.upgrade().map(|s| s.1.store(GcFlags::VISITED.bits(), Ordering::Release));
+    }
+
+    fn clear_visited(&self) {
+        self.upgrade().map(|s| s.1.store(GcFlags::NONE.bits(), Ordering::Release));
+    }
+
     fn root(&self) -> Box<dyn WeakGc> {
         Box::new(self.clone()) as Box<dyn WeakGc + Send>
+    }
+
+    fn flags(&self) -> Option<GcFlags> {
+        self.upgrade().map(|s| s.1.load(Ordering::Acquire) ).and_then(GcFlags::from_bits)
+    }
+
+    fn realloc(&self) -> Rc<dyn WeakGc> {
+        Rc::new(self.clone()) as Rc<dyn WeakGc>
     }
 }
 
@@ -149,7 +169,7 @@ impl<T: Trace> Trace for Gc<T> {
 // which case `strong_count` is correct but DIRTY was set.
 
 bitflags::bitflags! {
-    struct GcFlags: usize {
+    pub struct GcFlags: usize {
         const NONE = 0b00000000;
         const VISITED = 0b00000001;
         const DIRTY = 0b00000010;
@@ -198,6 +218,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
             // If we have an AtomicUsize that has the VISITED bit set, we need to
             // set (VISITED & DIRTY) in order to mitigate [Graph Tearing]
             // TODO: think about atomic orderings
+            // does this even need a load+cmpxchg instead of only cmpxchg??
             if GcFlags::from_bits(self.item.1.load(Ordering::Acquire)).unwrap().contains(GcFlags::VISITED) {
                 // Try to transition VISITED -> (VISITED & DIRTY).
                 // If the cmpxchg fails, we can just ignore it - either another
@@ -212,6 +233,9 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 if let Err(actual) = res {
                     println!("gc drop cmpxchg failed compare, was instead {:?}", GcFlags::from_bits(actual));
                 }
+                // we don't return - even thought we marked it dirty so it isn't
+                // collected this cycle, we have to buffer it on the channel
+                // so that it is a candidate for collection *next* cycle.
             }
             LOCAL_SENDER.with(|s| {
                 let weak = Arc::downgrade(&self.item).root();
