@@ -3,7 +3,7 @@ use crate::gc::{Gc, WeakGc};
 
 use std::cell::RefCell;
 use std::mem;
-use std::sync::{Arc, Weak, Mutex, RwLock, Barrier};
+use std::sync::{Arc, Weak, Mutex, RwLock, Condvar};
 // TODO: see if crossbeam mpmc is faster than std mpsc?
 use std::sync::mpsc::{Sender, Receiver, sync_channel, SyncSender};
 use std::thread::JoinHandle;
@@ -85,15 +85,6 @@ impl Collector {
         self.visited = Default::default();
     }
 
-    //pub fn visit(&mut self, item: &dyn Trace) {
-    //    // If we have a Gc<T>, insert a Weak<T> of it into our graph along with
-    //    // a self.prev->item edge.
-    //    // Else just add the items 
-    //    *self.working.entry(item as *const dyn Trace as *const () as usize).or_insert_with(
-    //        || item.
-    //    ) += 1;
-    //}
-
     pub fn add_node(&mut self, root: &dyn WeakGc) {
         println!("got new node {:x}", root.as_ptr());
         self.visited.entry(root.as_ptr()).or_insert_with(|| (root.strong_count(), 0) );
@@ -127,7 +118,9 @@ impl Collector {
                 Soul::Yuga(b) => {
                     println!("triggering yuga");
                     self.collect();
-                    b.wait();
+                    // signal to all listeners that the yuga ended
+                    *b.0.lock().unwrap() = true;
+                    b.1.notify_all();
                 }
                 _ => {}
             }
@@ -145,9 +138,12 @@ impl Collector {
 
     /// Trigger a cycle collection.
     pub fn yuga() {
-        let b = Arc::new(Barrier::new(2));
+        let b = Arc::new((Mutex::new(false), Condvar::new()));
         LOCAL_SENDER.with(|l| l.send(Soul::Yuga(b.clone())) ).unwrap();
-        b.wait();
+
+        // wait for the yuga to end
+        let mut lock = b.0.lock().unwrap();
+        while !*lock { lock = b.1.wait(lock).unwrap(); }
         println!("collection done");
     }
 }
@@ -164,7 +160,7 @@ pub enum Soul {
     Reclaimed(usize /* *const () */),
     /// A main thread wants to run a cycle collection immediately. Mostly used
     /// for testing.
-    Yuga(Arc<Barrier>),
+    Yuga(Arc<(Mutex<bool>, Condvar)>),
 }
 
 lazy_static::lazy_static! {
