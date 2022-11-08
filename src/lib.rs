@@ -1,4 +1,3 @@
-#![feature(allocator_api)]
 mod trace;
 mod gc;
 mod collector;
