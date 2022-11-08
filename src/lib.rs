@@ -53,7 +53,7 @@ mod tests {
     fn simple_bar() {
         let item = Gc::new(Bar { b: 0, bar: Gc::empty() });
         assert_eq!(item.get(|i| i.b), 0);
-        item.set(|mut i| i.b = 1);
+        item.set(|i| i.b = 1);
         assert_eq!(item.get(|i| i.b), 1);
     }
 
@@ -68,7 +68,7 @@ mod tests {
         });
         println!("1");
         assert_eq!(bar.get(|i| i.b), 0);
-        bar.set(|mut i| i.b = 1);
+        bar.set(|i| i.b = 1);
         println!("2");
         assert_eq!(bar.get(|i| i.b), 1);
         assert_eq!(foo.get(|i| i.bar.get(|i2| i2.b)), 1);
@@ -89,9 +89,9 @@ mod tests {
         let a1 = Gc::new(Bar { b: 0, bar: Gc::empty() });
         let a2 = Gc::new(Bar { b: 1, bar: Gc::empty() });
         let a3 = Gc::new(Bar { b: 2, bar: Gc::empty() });
-        a1.set(|mut a| a.bar = a2.clone());
-        a2.set(|mut a| a.bar = a3.clone());
-        a3.set(|mut a| a.bar = a1.clone());
+        a1.set(|a| a.bar = a2.clone());
+        a2.set(|a| a.bar = a3.clone());
+        a3.set(|a| a.bar = a1.clone());
         println!("1");
         drop(a1);
         Collector::yuga();
@@ -108,34 +108,44 @@ mod tests {
         let a1 = Gc::new(Bar { b: 0, bar: Gc::empty() });
         let a2 = Gc::new(Bar { b: 1, bar: Gc::empty() });
         let a3 = Gc::new(Bar { b: 2, bar: Gc::empty() });
-        a1.set(|mut a| a.bar = a2.clone());
-        a2.set(|mut a| a.bar = a3.clone());
-        a3.set(|mut a| a.bar = a1.clone());
+        a1.set(|a| a.bar = a2.clone());
+        a2.set(|a| a.bar = a3.clone());
+        a3.set(|a| a.bar = a1.clone());
         println!("1");
         drop(a1);
         drop(a2);
         println!("2");
-        a3.set(|mut a| {
+        a3.set(|a| {
             Collector::yuga();
             drop(a);
         });
     }
 
     #[test]
-    fn cyclic_in_cyclic() {
-        let a1 = Gc::new(Bar { b: 0, bar: Gc::empty() });
-        let a2 = Gc::new(Bar { b: 1, bar: Gc::empty() });
-        let a3 = Gc::new(Bar { b: 2, bar: Gc::empty() });
-        a1.set(|mut a| a.bar = a2.clone());
-        a2.set(|mut a| a.bar = a3.clone());
-        a3.set(|mut a| a.bar = a1.clone());
+    fn two_cycles() {
+        struct Join { a: Gc<Bar>, b: Gc<Bar> };
+        let join = {
+            let a1 = Gc::new(Bar { b: 0, bar: Gc::empty() });
+            let a2 = Gc::new(Bar { b: 1, bar: Gc::empty() });
+            let a3 = Gc::new(Bar { b: 2, bar: Gc::empty() });
+            a1.set(|a| a.bar = a2.clone());
+            a2.set(|a| a.bar = a3.clone());
+            a3.set(|a| a.bar = a1.clone());
+
+            let b1 = Gc::new(Bar { b: 3, bar: Gc::empty() });
+            let b2 = Gc::new(Bar { b: 4, bar: Gc::empty() });
+            let b3 = Gc::new(Bar { b: 5, bar: Gc::empty() });
+            b1.set(|b| b.bar = b2.clone());
+            b2.set(|b| b.bar = b3.clone());
+            b3.set(|b| b.bar = b1.clone());
+
+            Join { a: a1.clone(), b: b1.clone() }
+        };
+
         println!("1");
-        drop(a1);
-        drop(a2);
-        let a4 = Gc::new(Bar { b: 3, bar: a3.clone() });
-        drop(a4.clone());
-        drop(a3);
+        Collector::yuga();
         println!("2");
+        drop(join);
         Collector::yuga();
     }
 }

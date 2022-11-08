@@ -26,7 +26,7 @@ impl<'a> Clone for Root<'a> {
 pub struct Collector<'a> {
     deferred: OrdMap<usize, Root<'a>>,
     pub visited: HashMap<usize, (usize, usize, usize)>, // ptr -> (starting strong count, incoming edges, id)
-    neighbors: Vec<RoaringBitmap>,
+    neighbors: Vec<RoaringBitmap>, // adjacency list for visited ids. tracks *incoming* edges.
 }
 
 // Note [Defer List]
@@ -131,9 +131,14 @@ impl<'a> Collector<'a> {
             let flags = gc.0.flags().unwrap();
             println!("{:x}:{}:{} ({:?}) - {:?}", node, count, incoming,
                 flags, edges);
+            // we have to reset the bitflags for all of our objects, in case they
+            // *weren't* dirty.
             gc.0.clear_visited();
             if count == incoming && !flags.contains(GcFlags::DIRTY) {
                 for edge in edges {
+                    // XXX: do we also have to check if edge is fine?
+                    // if we are a part of the same component as an incoming
+                    // edge, then we've found a cycle and break it.
                     if components.find(*idx) == components.find(edge as usize) {
                         println!("part of cycle");
                         gc.0.invalidate();
@@ -143,9 +148,8 @@ impl<'a> Collector<'a> {
                 }
             }
         }
-        // TODO cycle break
         // We can now reset our working sets of objects; possibly-cyclic data
-        // from the worker threads will all be added against since it's buffered
+        // from the worker threads will all be added later since it's buffered
         // in the channel while we were working.
         self.visited = Default::default();
         self.deferred = Default::default();
@@ -276,7 +280,7 @@ lazy_static::lazy_static! {
 thread_local! {
     pub static LOCAL_SENDER: SyncSender<Soul> = {
         let send = COLLECTOR.0.lock().unwrap().clone();
-        COLLECTOR_HANDLE.read(); // touch the collector handle so that it starts if needed
+        COLLECTOR_HANDLE.read().unwrap(); // touch the collector handle so that it starts if needed
         send
     }
 }

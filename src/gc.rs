@@ -40,7 +40,7 @@ impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize)> {
         // still better than a full stop-the-world phase. We also simply immediately
         // skip tracing a root if we can't acquire a read-lock, which means
         // a mutator thread is currently holding a write-lock and thus the object
-        // is definitely still reachable (unless they mem::forgot the guard).
+        // is definitely still reachable.
         let Some(upgraded) = self.upgrade() else {
             // we couldn't upgrade the weak reference, so it was a dead root object
             println!("visited dead weakgc");
@@ -61,7 +61,9 @@ impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize)> {
             reader.trace(self, c);
             true
         } else {
-            unimplemented!();
+            // we got a read-lock, but the object is None - this should only
+            // happen if we already broke a cycle somehow.
+            println!("empty weakgc");
             false
         }
     }
@@ -95,7 +97,7 @@ impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize)> {
     }
 
     fn invalidate(&self) {
-        self.upgrade().map(|mut s| s.0.write().unwrap().take() );
+        self.upgrade().map(|s| s.0.write().unwrap().take() );
     }
 }
 
@@ -115,6 +117,8 @@ impl<T: Trace> Trace for Gc<T> {
         // Else get a weak reference to the object, and add it to the graph and
         // an edge from root->self.
         if (self.item.1.load(Ordering::Acquire) & GcFlags::VISITED.bits()) == 0 {
+            // TODO: this could probably be more efficient - there's no reason
+            // to make a weak ref if the item is already in the node map...
             c.add_node(&Arc::downgrade(&self.item));
         }
         c.add_edge(root, &Arc::downgrade(&self.item));
@@ -159,8 +163,8 @@ impl<T: Trace> Trace for Gc<T> {
 // if it has DIRTY set in its bitfield.
 // This fixes the graph tearing problem: when we double check either
 // 1) the mutator is currently holding a live reference it added, in which case
-// `strong_count` was incremented 2) it added and then removed a reference, in
-// which case `strong_count` is correct but DIRTY was set.
+// `strong_count` is more than incoming-count 2) it added and then removed a
+// reference, in which case `strong_count` is correct but DIRTY was set.
 
 bitflags::bitflags! {
     pub struct GcFlags: usize {
@@ -173,6 +177,8 @@ bitflags::bitflags! {
 impl<T: Trace + 'static> Drop for Gc<T> {
     fn drop(&mut self) {
         if crate::collector::COLLECTOR_HANDLE.read().unwrap().thread().id() == std::thread::current().id() {
+            // the collector thread upgrades and downgrades its weak handles a lot,
+            // and they should never be added to the deferred list.
             println!("dropping gc on collector thread");
             return drop(&mut self.item);
         }
@@ -184,6 +190,12 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 // chance it's the defer list (say, because we had a reference count
                 // of two and decremented it twice in quick succession), so we
                 // try to remove it from the list.
+                // (The weak count could be because we sent the item to the collector
+                // while it was running a cycle collector, and thus the Weak<T>
+                // is buffered in the channel and we can't remove it until the
+                // collector finishes - there's probably some weird cache we could
+                // do to mitigate that if it's a problem e.g. while collection
+                // is happening add/remove to a per-cpu hashmap instead)
                 println!("reclaiming soul");
                 let ptr = Arc::as_ptr(&self.item);
                 LOCAL_SENDER.with(|s| {
