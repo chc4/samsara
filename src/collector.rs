@@ -1,5 +1,5 @@
 use crate::trace::Trace;
-use crate::gc::{Gc, WeakGc};
+use crate::gc::{Gc, WeakGc, GcFlags};
 
 use std::cell::RefCell;
 use std::mem;
@@ -11,6 +11,8 @@ use std::thread::JoinHandle;
 use core::marker::PhantomData;
 
 use im::{HashSet, HashMap, OrdSet, OrdMap};
+use roaring::RoaringBitmap;
+use reunion::{UnionFind, UnionFindTrait};
 
 struct Root<'a>(Rc<dyn WeakGc>, PhantomData<&'a ()>);
 
@@ -23,7 +25,8 @@ impl<'a> Clone for Root<'a> {
 #[derive(Default)]
 pub struct Collector<'a> {
     deferred: OrdMap<usize, Root<'a>>,
-    pub visited: HashMap<usize, (usize, usize)>, // ptr -> (starting strong count, incoming edges)
+    pub visited: HashMap<usize, (usize, usize, usize)>, // ptr -> (starting strong count, incoming edges, id)
+    neighbors: Vec<RoaringBitmap>,
 }
 
 // Note [Defer List]
@@ -99,49 +102,87 @@ impl<'a> Collector<'a> {
                     im::ordmap::DiffItem::Update { old, new } => new.1,
                     im::ordmap::DiffItem::Remove(o, i) => { println!("REMOVED"); i },
                 };
-                //let im::ordmap::DiffItem::Add(_, item) = item else { continue };
                 self.add_node(&*item.0);
                 println!("collection visiting 0x{:x}", item.0.as_ptr());
-                let x = item.0.visit(self);
-                // do something with x
+                let visitable = item.0.visit(self);
+                if !visitable {
+                    println!("figure out how to shortcut");
+                    // probably just clear_visited() on it and then
+                    // remove it from both the visited and snapshot sets?
+                    // we don't know anything about gc objects reachable from this
+                    // live objects, so we can't 
+                }
             }
             visited = snap;
-            if self.deferred.len() == visited.len() {
+            if self.deferred.ptr_eq(&visited) {
                 // we didn't add any new items, and we're done
                 break
             }
         }
-        // Now we break cycles from our roots using the [Cycle Collection]
-        // scheme while taking care to handle [Graph Tearing]
-        for (node, (count, incoming)) in self.visited.iter() {
+        // We've visited all the nodes in our graph! The only possible candidates
+        // for cycles are nodes where their initial count == incoming AND they aren't
+        // marked DIRTY.
+        let mut nodes = self.visited.iter().collect::<Vec<_>>();
+        nodes.sort_by_key(|n| n.1.2);
+        let mut components = UnionFind::<usize>::new();
+        for (node, (count, incoming, idx)) in nodes {
             let gc = self.deferred.get(node).expect(format!("{:x}", node).as_str());
-            println!("{:x}:{}:{} ({:?})", node, count, incoming,
-                gc.0.flags().unwrap());
+            let edges = &self.neighbors[*idx];
+            let flags = gc.0.flags().unwrap();
+            println!("{:x}:{}:{} ({:?}) - {:?}", node, count, incoming,
+                flags, edges);
             gc.0.clear_visited();
+            if count == incoming && !flags.contains(GcFlags::DIRTY) {
+                for edge in edges {
+                    if components.find(*idx) == components.find(edge as usize) {
+                        println!("part of cycle");
+                        gc.0.invalidate();
+                        break; // ???
+                    }
+                    components.union(*idx, edge as usize);
+                }
+            }
         }
+        // TODO cycle break
+        // We can now reset our working sets of objects; possibly-cyclic data
+        // from the worker threads will all be added against since it's buffered
+        // in the channel while we were working.
         self.visited = Default::default();
         self.deferred = Default::default();
+        self.neighbors = Default::default();
     }
 
     pub fn add_node(&mut self, root: &dyn WeakGc) -> bool {
+        if root.as_ptr() == 0 { panic!() }
         let mut novel = false;
         self.visited.entry(root.as_ptr()).or_insert_with(|| {
+            // We didn't already visit the gc object, so we are initially adding
+            // it to the graph; we set the VISIT flag for [Graph Tearing] and then
+            // initialize the vertex with the correct weight, and also add it to
+            // our list of all root nodes so that we visit it later.
             println!("got new node {:x}", root.as_ptr());
             root.mark_visited();
-            // we have to add the root to the list somewhere - this is kinda stupid
-            // because we may already have it in the 
             self.deferred.entry(root.as_ptr()).or_insert_with(|| {
                 Root(root.realloc(), PhantomData)
             });
+            let idx = self.neighbors.len();
+            self.neighbors.push(RoaringBitmap::new());
             novel = true;
-            (root.strong_count(), 0)
+            (root.strong_count(), 0, idx)
         });
+        // it's probably useful to be able to tell if we are first seeing a node
+        // or not...? i can't think of for what right now, though
         novel
     }
 
     pub fn add_edge(&mut self, root: &dyn WeakGc, item: &dyn WeakGc) {
         println!("got edge {:x}->{:x}", root.as_ptr(), item.as_ptr());
-        self.visited.entry(root.as_ptr()).and_modify(|e| e.1 += 1 ).or_insert_with(|| panic!() );
+        let root_idx = self.visited.entry(root.as_ptr()).and_modify(|e| {
+            // TODO: do we need incoming edge count now that we have adjacency lists?
+            e.1 += 1
+        }).or_insert_with(|| panic!() ).2;
+        // add the reverse edge to our graph
+        self.neighbors[self.visited.get(&item.as_ptr()).unwrap().2].insert(root_idx as u32);
     }
 
     fn process(&mut self) {
@@ -164,7 +205,7 @@ impl<'a> Collector<'a> {
                 },
                 Soul::Reclaimed(d) => {
                     println!("told about a definitely not cyclic object 0x{:x}", d);
-
+                    self.deferred.remove(&d);
                 },
                 Soul::Yuga(b) => {
                     println!("triggering yuga");

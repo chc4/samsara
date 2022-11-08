@@ -38,16 +38,23 @@ mod tests {
 
     impl Trace for Bar {
         fn trace(&self, root: &dyn WeakGc, c: &mut Collector) {
+            println!("trace {}", self.b);
             self.bar.trace(root, c);
+        }
+    }
+
+    impl Drop for Bar {
+        fn drop(&mut self) {
+            println!("drop {}", self.b);
         }
     }
 
     #[test]
     fn simple_bar() {
         let item = Gc::new(Bar { b: 0, bar: Gc::empty() });
-        assert_eq!(item.get().b, 0);
+        assert_eq!(item.get(|i| i.b), 0);
         item.set(|mut i| i.b = 1);
-        assert_eq!(item.get().b, 1);
+        assert_eq!(item.get(|i| i.b), 1);
     }
 
     #[test]
@@ -60,17 +67,17 @@ mod tests {
             foo3: Gc::empty(),
         });
         println!("1");
-        assert_eq!(bar.get().b, 0);
+        assert_eq!(bar.get(|i| i.b), 0);
         bar.set(|mut i| i.b = 1);
         println!("2");
-        assert_eq!(bar.get().b, 1);
-        assert_eq!(foo.get().bar.get().b, 1);
+        assert_eq!(bar.get(|i| i.b), 1);
+        assert_eq!(foo.get(|i| i.bar.get(|i2| i2.b)), 1);
         println!("3");
         drop(foo);
         println!("4");
         Collector::yuga();
         println!("5");
-        assert_eq!(bar.get().b, 1);
+        assert_eq!(bar.get(|i| i.b), 1);
         drop(bar);
         println!("6");
         Collector::yuga();
@@ -93,6 +100,42 @@ mod tests {
         Collector::yuga();
         println!("3");
         drop(a3);
+        Collector::yuga();
+    }
+
+    #[test]
+    fn held_cyclic() {
+        let a1 = Gc::new(Bar { b: 0, bar: Gc::empty() });
+        let a2 = Gc::new(Bar { b: 1, bar: Gc::empty() });
+        let a3 = Gc::new(Bar { b: 2, bar: Gc::empty() });
+        a1.set(|mut a| a.bar = a2.clone());
+        a2.set(|mut a| a.bar = a3.clone());
+        a3.set(|mut a| a.bar = a1.clone());
+        println!("1");
+        drop(a1);
+        drop(a2);
+        println!("2");
+        a3.set(|mut a| {
+            Collector::yuga();
+            drop(a);
+        });
+    }
+
+    #[test]
+    fn cyclic_in_cyclic() {
+        let a1 = Gc::new(Bar { b: 0, bar: Gc::empty() });
+        let a2 = Gc::new(Bar { b: 1, bar: Gc::empty() });
+        let a3 = Gc::new(Bar { b: 2, bar: Gc::empty() });
+        a1.set(|mut a| a.bar = a2.clone());
+        a2.set(|mut a| a.bar = a3.clone());
+        a3.set(|mut a| a.bar = a1.clone());
+        println!("1");
+        drop(a1);
+        drop(a2);
+        let a4 = Gc::new(Bar { b: 3, bar: a3.clone() });
+        drop(a4.clone());
+        drop(a3);
+        println!("2");
         Collector::yuga();
     }
 }

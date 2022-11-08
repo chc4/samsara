@@ -14,7 +14,7 @@ pub struct Gc<T: Trace + 'static> {
     // an RwLock so that we acquire read-locks from the collector without blocking
     // in most cases, and an AtomicUsize so we can properly handle [Graph tearing]
     // when collecting.
-    item: Arc<(Option<RwLock<T>>, AtomicUsize)>
+    item: Arc<(RwLock<Option<T>>, AtomicUsize)>
 }
 
 pub trait WeakGc: Send {
@@ -26,14 +26,9 @@ pub trait WeakGc: Send {
     fn mark_visited(&self);
     fn flags(&self) -> Option<GcFlags>;
     fn realloc(&self) -> std::rc::Rc<dyn WeakGc>;
+    fn invalidate(&self);
 }
-impl<T: Trace + 'static> WeakGc for Weak<(Option<RwLock<T>>, AtomicUsize)> {
-    // We have a set of WeakGc objects from our defer list
-    // For each of them we visit, which tries to acquire a read-lock, mark it VISTIED,
-    // add it to our visited set with a value=strong_count, and then visit all its
-    // children via a work queue, in order to find Gc<T> objects it transitively
-    // has references to. Those Gc<T> objects we downgrade and add them to the root set
-    // along with keeping track that we have an edge from the start->new.
+impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize)> {
     fn visit(&self, c: &mut Collector) -> bool {
         // When we visit a WeakGc object from our defer list root, we have to
         // acquire a read-lock. This is because there could be a sequence
@@ -51,25 +46,22 @@ impl<T: Trace + 'static> WeakGc for Weak<(Option<RwLock<T>>, AtomicUsize)> {
             println!("visited dead weakgc");
             return false;
         };
-        let r = upgraded.0.as_ref().map(|p| p.try_read() );
-        if let Some(Ok(reader)) = r {
-            // We were able to acquire a read-lock, so we know it doesn't have a
-            // write-lock outstanding; we now mark it as VISITED and then acquire
-            // the strong count to handle [Graph Tearing]
-            let strong_count = self.strong_count();
-            let ptr = self.as_ptr() as usize;
-            // This object is definitely already in the graph; either we are visiting
-            // it from the initial deferred list root set, in which case we added
-            // it to the graph, or it was reachable from a previous Trace.trace
-            // and we added it in there.
-            println!("started tracing weakgc 0x{:x}", ptr);
-            reader.trace(self, c);
-            true
-        } else {
+        let Ok(r) = upgraded.0.try_read() else {
             println!("can't acquire read-lock on weakgc");
             // We couldn't acquire a read-lock, so we know *something* else has
             // an outstanding lock. The collector doesn't hold guards, so it must
             // be a mutator, which means the object is still reachable.
+            return false;
+        };
+        if let Some(reader) = r.as_ref() {
+            // We were able to acquire a read-lock, so we know it doesn't have a
+            // write-lock outstanding. Now we visit the object to find all reachable
+            // Gc<T> objects to add to our worklist.
+            println!("started tracing weakgc 0x{:x}", self.as_ptr() as usize);
+            reader.trace(self, c);
+            true
+        } else {
+            unimplemented!();
             false
         }
     }
@@ -80,6 +72,10 @@ impl<T: Trace + 'static> WeakGc for Weak<(Option<RwLock<T>>, AtomicUsize)> {
 
     fn strong_count(&self) -> usize {
         self.strong_count()
+    }
+
+    fn flags(&self) -> Option<GcFlags> {
+        self.upgrade().map(|s| s.1.load(Ordering::Acquire) ).and_then(GcFlags::from_bits)
     }
 
     fn mark_visited(&self) {
@@ -94,12 +90,12 @@ impl<T: Trace + 'static> WeakGc for Weak<(Option<RwLock<T>>, AtomicUsize)> {
         Box::new(self.clone()) as Box<dyn WeakGc + Send>
     }
 
-    fn flags(&self) -> Option<GcFlags> {
-        self.upgrade().map(|s| s.1.load(Ordering::Acquire) ).and_then(GcFlags::from_bits)
-    }
-
     fn realloc(&self) -> Rc<dyn WeakGc> {
         Rc::new(self.clone()) as Rc<dyn WeakGc>
+    }
+
+    fn invalidate(&self) {
+        self.upgrade().map(|mut s| s.0.write().unwrap().take() );
     }
 }
 
@@ -113,9 +109,7 @@ impl<T: Trace> Trace for Gc<T> {
     fn trace(&self, root: &dyn WeakGc, c: &mut Collector) {
         // We only trace Gc<T> objects as objects reachable from a WeakGc root,
         // never as the entry-point.
-        // If we can just skip cloning the Arc, do so.
-        if self.item.0.is_none() { println!("empty gc"); return; }
-        // or if the root is the same as a reachable object, it's just a self-loop.
+        // if the root is the same as a reachable object, it's just a self-loop.
         if Arc::as_ptr(&self.item) as usize == root.as_ptr() { unimplemented!("what do we do here?") }
 
         // Else get a weak reference to the object, and add it to the graph and
@@ -148,15 +142,15 @@ impl<T: Trace> Trace for Gc<T> {
 // initialize the node value to `strong_count`, by the time we visit all nodes
 // that value may be stale.
 //
-// Luckily there is a fix, which we implement. When considering nodes for SCC subgraphs
-// of value=0 items, we can double-check that `strong_count` is still the same
-// as when we started: if it is greater an additional edge was created, which has
-// to have been done by a mutator, and thus the object (and SCC) is still alive.
+// Luckily there is a fix. When considering nodes for SCC subgraphs of value=0
+// items, we *could* double-check that `strong_count` is still the same as when
+// we started: if it is greater an additional edge was created, which has to have
+// been done by a mutator, and thus the object (and SCC) is still alive.
 //
 // We also have to handle the mutator both creating *and then removing* an edge,
 // however! The additional edge could have been added for B->A, and then removed
 // before we double-check items; in that case the `strong_count` value is still
-// the same, but we still double-counted. This lends us the actual implementation
+// the same, but we still double-counted. This lends us the *actual* implementation
 // that we use: we add an AtomicUsize to all Gc<T> objects, which provide a bitfield
 // of flags. When we visit an object, the first thing we do is set a VISITED bit
 // on the object. If a mutator drops an object, if it has a VISITED bit it sets
@@ -190,7 +184,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 // chance it's the defer list (say, because we had a reference count
                 // of two and decremented it twice in quick succession), so we
                 // try to remove it from the list.
-                println!("sending soul");
+                println!("reclaiming soul");
                 let ptr = Arc::as_ptr(&self.item);
                 LOCAL_SENDER.with(|s| {
                     let rec = s.try_send(Soul::Reclaimed(ptr as usize));
@@ -208,7 +202,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 // We know it didn't have a weak count, so wasn't added to
                 // the defer list. We just clean up the object entirely.
                 // Fall through to the normal Arc drop.
-                println!("cleaning up");
+                println!("immediate free");
             }
         } else {
             // We're dropping an object, and it is possibly the member of a cycle
@@ -242,19 +236,19 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 s.try_send(Soul::Died(weak))
             });
         }
-        drop(&mut self.item);
+        drop(&mut self.item)
     }
 }
 
 impl<T: Trace> Gc<T> {
     pub fn new(t: T) -> Self {
-        Gc { item: Arc::new((Some(RwLock::new(t)), AtomicUsize::new(0))) }
+        Gc { item: Arc::new((RwLock::new(Some(t)), AtomicUsize::new(0))) }
     }
 
     /// Used internally to create an empty version of a Gc<T>, in order to break cycles
     /// and initialize cyclic testcases.
     pub(crate) fn empty() -> Self {
-        Gc { item: Arc::new((None, AtomicUsize::new(0))) }
+        Gc { item: Arc::new((RwLock::new(None), AtomicUsize::new(0))) }
     }
 
     /// Get a read-only view of the contents of the Gc<T> object. This acquires
@@ -265,12 +259,12 @@ impl<T: Trace> Gc<T> {
     /// If used in the Drop impl of an object contained within a Gc<T>, this method
     /// may panic due to attempting to dereference a Gc pointer that has been nullified
     /// in order to break cycles - however, in normal operations, it will not panic.
-    pub fn get(&self) -> RwLockReadGuard<T> {
-        self.item.0.as_ref().as_ref().unwrap().read().unwrap()
+    pub fn get<F, O>(&self, f: F) -> O where F: Fn(&T) -> O {
+        f(self.item.0.read().unwrap().as_ref().unwrap())
     }
 
-    pub fn set<F, O>(&self, f: F) -> O where F: Fn(RwLockWriteGuard<T>) -> O {
-        let guard = self.item.0.as_ref().as_ref().unwrap().write().unwrap();
-        f(guard)
+    pub fn set<F, O>(&self, f: F) -> O where F: Fn(&mut T) -> O {
+        let mut guard = self.item.0.write().unwrap();
+        f(guard.as_mut().unwrap())
     }
 }
