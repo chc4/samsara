@@ -1,20 +1,33 @@
 use crate::trace::Trace;
-use crate::collector::{Collector, Soul, LOCAL_SENDER};
+use crate::collector::{Collector, Soul, LOCAL_SENDER, SyncSender};
 
-use std::sync::RwLock;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Weak};
-use std::sync::{RwLockReadGuard, RwLockWriteGuard};
-use std::sync::mpsc::TrySendError;
+use std::error::Error;
 use std::rc::Rc;
 
+#[cfg(not(all(feature = "shuttle", test)))]
+use std::{thread, sync::{atomic::*, Arc, Weak, RwLock, RwLockReadGuard, RwLockWriteGuard}};
+#[cfg(all(feature = "shuttle", test))]
+use shuttle::{thread, sync::{atomic::*, Arc, Weak, RwLock, RwLockReadGuard, RwLockWriteGuard}};
+
+use crate::tracker::{Tracker, TrackerLocation};
+
+lazy_static::lazy_static! {
+    static ref LIVE_COUNT: TrackerLocation = {
+        TrackerLocation::new(AtomicUsize::new(0))
+    };
+}
+
+pub fn number_of_live_objects() -> usize {
+    LIVE_COUNT.get()
+}
+
+#[derive(Debug)]
 pub struct Gc<T: Trace + 'static> {
     // The item needs an Option so we can null out objects to break cycles,
     // an RwLock so that we acquire read-locks from the collector without blocking
     // in most cases, and an AtomicUsize so we can properly handle [Graph tearing]
     // when collecting.
-    item: Arc<(RwLock<Option<T>>, AtomicUsize)>
+    item: Arc<(RwLock<Option<T>>, AtomicUsize, Tracker)>
 }
 
 pub trait WeakGc: Send {
@@ -28,7 +41,7 @@ pub trait WeakGc: Send {
     fn realloc(&self) -> std::rc::Rc<dyn WeakGc>;
     fn invalidate(&self);
 }
-impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize)> {
+impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize, Tracker)> {
     fn visit(&self, c: &mut Collector) -> bool {
         // When we visit a WeakGc object from our defer list root, we have to
         // acquire a read-lock. This is because there could be a sequence
@@ -174,9 +187,24 @@ bitflags::bitflags! {
     }
 }
 
+// shuttle doesn't have a channel try_send method. we don't want to block the
+// mutator threads when trying to send Reclaimed events, since the worst case
+// is just the collector doing some extra work and fail to upgrade a dead Weak<T>
+// instead of blocking user code.
+fn try_send<T: Send + 'static>(chan: &SyncSender<T>, val: T) -> Result<(), Box<dyn Error>> {
+    #[cfg(not(all(feature = "shuttle", test)))]
+    {
+        chan.try_send(val).map_err(|e| Box::new(e) as Box<dyn Error>)
+    }
+    #[cfg(all(feature = "shuttle", test))]
+    {
+        chan.send(val).map_err(|e| Box::new(e) as Box<dyn Error>)
+    }
+}
+
 impl<T: Trace + 'static> Drop for Gc<T> {
     fn drop(&mut self) {
-        if crate::collector::COLLECTOR_HANDLE.read().unwrap().thread().id() == std::thread::current().id() {
+        if crate::collector::IS_COLLECTOR.with(|b|{ b.load(Ordering::Acquire) }) {
             // the collector thread upgrades and downgrades its weak handles a lot,
             // and they should never be added to the deferred list.
             println!("dropping gc on collector thread");
@@ -199,16 +227,9 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 println!("reclaiming soul");
                 let ptr = Arc::as_ptr(&self.item);
                 LOCAL_SENDER.with(|s| {
-                    let rec = s.try_send(Soul::Reclaimed(ptr as usize));
-                    match rec {
-                        Err(TrySendError::Disconnected(_)) => {
-                            unimplemented!("collector thread died?")
-                        },
-                        Err(TrySendError::Full(_)) => {
-                            unimplemented!("collector channel full")
-                        },
-                        Ok(_) => { },
-                    }
+                    let rec = try_send(&s.chan.borrow().as_ref().unwrap(), Soul::Reclaimed(ptr as usize));
+
+                    rec.map_err(|e| unimplemented!("sending soul error {:?}", e))
                 });
             } else {
                 // We know it didn't have a weak count, so wasn't added to
@@ -245,7 +266,15 @@ impl<T: Trace + 'static> Drop for Gc<T> {
             }
             LOCAL_SENDER.with(|s| {
                 let weak = Arc::downgrade(&self.item).root();
-                s.try_send(Soul::Died(weak))
+                // this may block, blocking mutator thread! this can happen if
+                // the collector thread is processing too many recvs from too many
+                // threads and can't keep up with bandwidth, or if its busy doing
+                // a collection and collectors fill up its work queue to process
+                // before it finishes.
+                // some of this could be made better by queuing work per-thread
+                // that we can clear via Reclaimed if the collector is doing a
+                // collection.
+                s.chan.borrow().as_ref().unwrap().send(Soul::Died(weak))
             });
         }
         drop(&mut self.item)
@@ -254,13 +283,15 @@ impl<T: Trace + 'static> Drop for Gc<T> {
 
 impl<T: Trace> Gc<T> {
     pub fn new(t: T) -> Self {
-        Gc { item: Arc::new((RwLock::new(Some(t)), AtomicUsize::new(0))) }
+        // We have to initialize the
+        LOCAL_SENDER.with(|_|
+            Gc { item: Arc::new((RwLock::new(Some(t)), AtomicUsize::new(0), Tracker::of(&LIVE_COUNT))) })
     }
 
     /// Used internally to create an empty version of a Gc<T>, in order to break cycles
     /// and initialize cyclic testcases.
     pub(crate) fn empty() -> Self {
-        Gc { item: Arc::new((RwLock::new(None), AtomicUsize::new(0))) }
+        Gc { item: Arc::new((RwLock::new(None), AtomicUsize::new(0), Tracker::of(&LIVE_COUNT))) }
     }
 
     /// Get a read-only view of the contents of the Gc<T> object. This acquires
@@ -276,7 +307,10 @@ impl<T: Trace> Gc<T> {
     }
 
     pub fn set<F, O>(&self, f: F) -> O where F: Fn(&mut T) -> O {
-        let mut guard = self.item.0.write().unwrap();
-        f(guard.as_mut().unwrap())
+        f(self.item.0.write().unwrap().as_mut().unwrap())
+    }
+
+    pub fn as_ptr(&self) -> *const () {
+        Arc::as_ptr(&self.item) as *const _ as *const _
     }
 }

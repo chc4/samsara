@@ -1,12 +1,14 @@
 mod trace;
 mod gc;
 mod collector;
+mod tracker;
+mod test;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right
 }
 
-#[cfg(test)]
+#[cfg(not(all(feature = "shuttle", test)))]
 mod tests {
     use super::*;
     use gc::{Gc, WeakGc};

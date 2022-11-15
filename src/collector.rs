@@ -1,18 +1,29 @@
 use crate::trace::Trace;
 use crate::gc::{Gc, WeakGc, GcFlags};
+use crate::tracker::{Tracker, TrackerLocation};
 
-use std::cell::RefCell;
-use std::mem;
+use std::cell::{RefCell, Cell};
 use std::rc::Rc;
-use std::sync::{Arc, Weak, Mutex, RwLock, Condvar};
-// TODO: see if crossbeam mpmc is faster than std mpsc?
-use std::sync::mpsc::{Sender, Receiver, sync_channel, SyncSender};
-use std::thread::JoinHandle;
+use std::mem;
 use core::marker::PhantomData;
 
 use im::{HashSet, HashMap, OrdSet, OrdMap};
 use roaring::RoaringBitmap;
 use reunion::{UnionFind, UnionFindTrait};
+
+#[cfg(all(feature = "shuttle", test))]
+use shuttle::thread_local;
+
+#[cfg(not(all(feature = "shuttle", test)))]
+use std::{sync::{Once, Arc, Weak, Mutex, RwLock, RwLockReadGuard, Condvar, atomic::{AtomicUsize, AtomicBool, Ordering}}, thread};
+#[cfg(all(feature = "shuttle", test))]
+use shuttle::{sync::{*, atomic::{AtomicUsize, AtomicBool, Ordering}}, thread, rand, rand::Rng};
+
+// TODO: see if crossbeam mpmc is faster than std mpsc?
+#[cfg(not(all(feature = "shuttle", test)))]
+pub use std::sync::mpsc::{Sender, Receiver, sync_channel, SyncSender};
+#[cfg(all(feature = "shuttle", test))]
+pub use shuttle::sync::mpsc::{Sender, Receiver, sync_channel, SyncSender};
 
 struct Root<'a>(Rc<dyn WeakGc>, PhantomData<&'a ()>);
 
@@ -124,11 +135,11 @@ impl<'a> Collector<'a> {
         // marked DIRTY.
         let mut nodes = self.visited.iter().collect::<Vec<_>>();
         nodes.sort_by_key(|n| n.1.2);
-        let mut components = UnionFind::<usize>::new();
-        for (node, (count, incoming, idx)) in nodes {
+        let mut components = UnionFind::<Option<usize>>::new();
+        for (node, (count, incoming, idx)) in nodes.drain(..) {
             let gc = self.deferred.get(node).expect(format!("{:x}", node).as_str());
             let edges = &self.neighbors[*idx];
-            let flags = gc.0.flags().unwrap();
+            let Some(flags) = gc.0.flags() else { println!("dead"); continue };
             println!("{:x}:{}:{} ({:?}) - {:?}", node, count, incoming,
                 flags, edges);
             // we have to reset the bitflags for all of our objects, in case they
@@ -139,13 +150,21 @@ impl<'a> Collector<'a> {
                     // XXX: do we also have to check if edge is fine?
                     // if we are a part of the same component as an incoming
                     // edge, then we've found a cycle and break it.
-                    if components.find(*idx) == components.find(edge as usize) {
+                    //
+                    // this is definitely wrong - we need to create components
+                    // instead, and then only at the end break cycles of Some(n)
+                    // components.
+                    let comp = components.find(Some(*idx));
+                    if comp.is_some() && comp == components.find(Some(edge as usize)) {
                         println!("part of cycle");
-                        gc.0.invalidate();
+                        //gc.0.invalidate();
                         break; // ???
                     }
-                    components.union(*idx, edge as usize);
+                    components.union(Some(*idx), Some(edge as usize));
                 }
+            } else {
+                // we could start tearing down the graph here i guess
+                components.union(Some(*idx), None);
             }
         }
         // We can now reset our working sets of objects; possibly-cyclic data
@@ -189,9 +208,8 @@ impl<'a> Collector<'a> {
         self.neighbors[self.visited.get(&item.as_ptr()).unwrap().2].insert(root_idx as u32);
     }
 
-    fn process(&mut self) {
-        let chan = COLLECTOR.1.try_lock().expect("multiple collectors were started?");
-        while let Ok(soul) = chan.recv() {
+    fn process(&mut self, receiver: Receiver<Soul>) {
+        while let Ok(soul) = { receiver.recv() }{
             println!("collector received soul");
             match soul {
                 Soul::Died(d) => {
@@ -217,7 +235,10 @@ impl<'a> Collector<'a> {
                     // signal to all listeners that the yuga ended
                     *b.0.lock().unwrap() = true;
                     b.1.notify_all();
-                }
+                },
+                Soul::Nirvana(()) => {
+                    println!("thread achieved nirvana");
+                },
                 _ => {}
             }
         }
@@ -225,23 +246,53 @@ impl<'a> Collector<'a> {
     }
 
     /// Start the collector thread.
-    fn start() -> JoinHandle<()> {
-        std::thread::spawn(|| {
+    fn start(recv: Receiver<Soul>) -> thread::JoinHandle<()> {
+        #[cfg(all(feature = "shuttle", test))]
+        let spawn = shuttle::thread::spawn;
+        #[cfg(not(all(feature = "shuttle", test)))]
+        let spawn = std::thread::spawn;
+
+        spawn(|| {
+            IS_COLLECTOR.with(|b| b.store(true, Ordering::Release));
             let mut collector: Self = Default::default();
-            collector.process();
+            collector.process(recv);
         })
     }
 
     /// Trigger a cycle collection.
     pub fn yuga() {
         let b = Arc::new((Mutex::new(false), Condvar::new()));
-        LOCAL_SENDER.with(|l| l.send(Soul::Yuga(b.clone())) ).unwrap();
+        println!("mutator forcing collection");
+        LOCAL_SENDER.with(|l| l.chan.borrow().as_ref().unwrap().send(Soul::Yuga(b.clone())) ).unwrap();
 
         // wait for the yuga to end
         let mut lock = b.0.lock().unwrap();
         while !*lock { lock = b.1.wait(lock).unwrap(); }
         println!("collection done");
     }
+
+    #[cfg(all(feature = "shuttle", test))]
+    /// Randomly trigger a non-blocking collection
+    pub fn maybe_yuga() {
+        if rand::thread_rng().gen::<bool>() == false { return ; }
+        let b = Arc::new((Mutex::new(false), Condvar::new()));
+        println!("mutator forcing non-blocking collection");
+        LOCAL_SENDER.with(|l| l.chan.borrow().as_ref().unwrap().send(Soul::Yuga(b.clone())) ).unwrap();
+
+        // wait for the yuga to end
+        println!("skipping wait");
+    }
+
+    #[cfg(all(feature = "shuttle", test))]
+    /// Unfortunately, shuttle doesn't run thread-local destructors when threads
+    /// *exit*, only when they are *joined*. This makes it report spurious dead-locks
+    /// when the Collector calls recv() on the communications channel - under normal
+    /// operations the LocalSender is dropped by all mutator threads and Weak<T> drops
+    /// all live SyncSenders, causing recv() to unblock.
+    pub fn nirvana() {
+        LOCAL_SENDER.with(|l|{ l.chan.take(); });
+    }
+
 }
 
 /// As GC objects are dropped, threads send Souls to the global Collector via
@@ -257,30 +308,51 @@ pub enum Soul {
     /// A main thread wants to run a cycle collection immediately. Mostly used
     /// for testing.
     Yuga(Arc<(Mutex<bool>, Condvar)>),
+    /// A thread that had an open channel exitted.
+    Nirvana(()),
 }
 
-lazy_static::lazy_static! {
-    // TODO: see if it's better to do a concurrent hashset instead of serializing
-    // over a channel; our defer set is actually the dual of a lattice, since if
-    // a thread is removing an item from the set it can never be concurrently
-    // being added by another, and if two threads are adding an item to the defer
-    // list we can just drop one of them when we join the lattice.
-    pub static ref COLLECTOR: (Mutex<SyncSender<Soul>>, Mutex<Receiver<Soul>>) = {
-        let (send, recv) = sync_channel(128);
-        (Mutex::new(send), Mutex::new(recv))
+thread_local! {
+    pub static IS_COLLECTOR: AtomicBool = {
+        AtomicBool::new(false)
     };
 }
 
+pub struct LocalSender {
+    pub chan: RefCell<Option<Arc<SyncSender<Soul>>>>,
+}
+
+impl Drop for LocalSender {
+    fn drop(&mut self) {
+        println!("drop");
+        let Self { chan } = self;
+        //chan.borrow().as_ref().map(|chan| chan.send(Soul::Nirvana(())).unwrap());
+        drop(chan);
+    }
+}
+
 lazy_static::lazy_static! {
-    pub static ref COLLECTOR_HANDLE: Arc<RwLock<JoinHandle<()>>> = {
-        Arc::new(RwLock::new(Collector::start()))
+    static ref CHANNEL: RwLock<Weak<SyncSender<Soul>>> = {
+        RwLock::new(Weak::new())
     };
 }
 
 thread_local! {
-    pub static LOCAL_SENDER: SyncSender<Soul> = {
-        let send = COLLECTOR.0.lock().unwrap().clone();
-        COLLECTOR_HANDLE.read().unwrap(); // touch the collector handle so that it starts if needed
-        send
+    pub static LOCAL_SENDER: LocalSender = {
+        let mut guard = CHANNEL.write().unwrap();
+        let send = if let Some(chan) = Weak::upgrade(&*guard) {
+            // if there is already a channel for the collector, use it
+            chan
+        } else {
+            // otherwise, we have to start a new collecotr
+            let (send, recv) = sync_channel(128);
+            let send = Arc::new(send);
+            *guard = Arc::downgrade(&send);
+            drop(guard);
+            Collector::start(recv);
+            send
+
+        };
+        LocalSender { chan: RefCell::new(Some(send)) }
     }
 }
