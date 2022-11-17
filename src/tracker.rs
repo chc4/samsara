@@ -43,28 +43,20 @@ impl Tracker {
     fn gain(loc: &'static TrackerLocation) {
         let mut old = loc.val.load(Ordering::Acquire);
         loop {
-            let Ok(new) = loc.val.compare_exchange(old, old + 1, Ordering::Acquire, Ordering::Relaxed) else {
-                continue;
+            match loc.val.compare_exchange(old, old + 1, Ordering::Acquire, Ordering::Relaxed) {
+                Err(curr) => { old = curr; continue; },
+                Ok(new) => { assert_eq!(old, new); break },
             };
-            if new == old {
-                break;
-            } else {
-                old = new;
-            }
         }
     }
 
     fn lose(loc: &'static TrackerLocation) {
         let mut old = loc.val.load(Ordering::Acquire);
         loop {
-            let Ok(new) = loc.val.compare_exchange(old, old - 1, Ordering::Acquire, Ordering::Relaxed) else {
-                continue;
+            match loc.val.compare_exchange(old, old - 1, Ordering::Acquire, Ordering::Relaxed) {
+                Err(curr) => { old = curr; continue; },
+                Ok(new) => { assert_eq!(old, new); break },
             };
-            if new == old {
-                break;
-            } else {
-                old = new;
-            }
         }
     }
 }

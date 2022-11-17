@@ -34,13 +34,13 @@ mod tests {
 
     pub struct Bar {
         b: usize,
-        bar: Gc<Bar>,
+        bar: Vec<Gc<Bar>>,
     }
 
     impl Trace for Bar {
         fn trace(&self, root: &dyn WeakGc, c: &mut Collector) {
             println!("trace {}", self.b);
-            self.bar.trace(root, c);
+            self.bar.iter().map(|e| e.trace(root, c)).for_each(drop);
         }
     }
 
@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn simple_bar() {
-        let item = Gc::new(Bar { b: 0, bar: Gc::empty() });
+        let item = Gc::new(Bar { b: 0, bar: vec![] });
         assert_eq!(item.get(|i| i.b), 0);
         item.set(|i| i.b = 1);
         assert_eq!(item.get(|i| i.b), 1);
@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn simple_foo() {
-        let bar = Gc::new(Bar { b: 0, bar: Gc::empty() });
+        let bar = Gc::new(Bar { b: 0, bar: vec![] });
         let foo = Gc::new(Foo { a: 0,
             bar: bar.clone(),
             foo1: Gc::empty(),
@@ -87,12 +87,12 @@ mod tests {
 
     #[test]
     fn simple_cyclic() {
-        let a1 = Gc::new(Bar { b: 0, bar: Gc::empty() });
-        let a2 = Gc::new(Bar { b: 1, bar: Gc::empty() });
-        let a3 = Gc::new(Bar { b: 2, bar: Gc::empty() });
-        a1.set(|a| a.bar = a2.clone());
-        a2.set(|a| a.bar = a3.clone());
-        a3.set(|a| a.bar = a1.clone());
+        let a1 = Gc::new(Bar { b: 0, bar: vec![] });
+        let a2 = Gc::new(Bar { b: 1, bar: vec![] });
+        let a3 = Gc::new(Bar { b: 2, bar: vec![] });
+        a1.set(|a| a.bar = vec![a2.clone()]);
+        a2.set(|a| a.bar = vec![a3.clone()]);
+        a3.set(|a| a.bar = vec![a1.clone()]);
         println!("1");
         drop(a1);
         Collector::yuga();
@@ -106,12 +106,12 @@ mod tests {
 
     #[test]
     fn held_cyclic() {
-        let a1 = Gc::new(Bar { b: 0, bar: Gc::empty() });
-        let a2 = Gc::new(Bar { b: 1, bar: Gc::empty() });
-        let a3 = Gc::new(Bar { b: 2, bar: Gc::empty() });
-        a1.set(|a| a.bar = a2.clone());
-        a2.set(|a| a.bar = a3.clone());
-        a3.set(|a| a.bar = a1.clone());
+        let a1 = Gc::new(Bar { b: 0, bar: vec![] });
+        let a2 = Gc::new(Bar { b: 1, bar: vec![] });
+        let a3 = Gc::new(Bar { b: 2, bar: vec![] });
+        a1.set(|a| a.bar = vec![a2.clone()]);
+        a2.set(|a| a.bar = vec![a3.clone()]);
+        a3.set(|a| a.bar = vec![a1.clone()]);
         println!("1");
         drop(a1);
         drop(a2);
@@ -123,22 +123,66 @@ mod tests {
     }
 
     #[test]
+    fn downstream_of_cyclic_1() {
+        let a1 = Gc::new(Bar { b: 0, bar: vec![] });
+        let a2 = Gc::new(Bar { b: 1, bar: vec![] });
+        let a3 = Gc::new(Bar { b: 2, bar: vec![] });
+        let live = Gc::new(Bar { b: 3, bar: vec![] });
+        a1.set(|a| a.bar = vec![a2.clone()]);
+        a2.set(|a| a.bar = vec![a3.clone()]);
+        a3.set(|a| a.bar = vec![a1.clone()]);
+        println!("1");
+        drop(a1);
+        drop(a2);
+        println!("2");
+        drop(a3);
+        drop(live.clone());
+        println!("3");
+        Collector::yuga();
+        println!("4");
+        assert_eq!(live.get(|l| l.b), 3);
+        assert_eq!(gc::number_of_live_objects(), 1);
+    }
+
+    #[test]
+    fn downstream_of_cyclic_2() {
+        let a1 = Gc::new(Bar { b: 0, bar: vec![] });
+        let a2 = Gc::new(Bar { b: 1, bar: vec![] });
+        let a3 = Gc::new(Bar { b: 2, bar: vec![] });
+        let live = Gc::new(Bar { b: 3, bar: vec![] });
+        a1.set(|a| a.bar = vec![a3.clone()]);
+        a2.set(|a| a.bar = vec![a1.clone()]);
+        a3.set(|a| a.bar = vec![a2.clone()]);
+        println!("1");
+        drop(a1);
+        drop(a2);
+        println!("2");
+        drop(a3);
+        drop(live.clone());
+        println!("3");
+        Collector::yuga();
+        println!("4");
+        assert_eq!(live.get(|l| l.b), 3);
+        assert_eq!(gc::number_of_live_objects(), 1);
+    }
+
+    #[test]
     fn two_cycles() {
         struct Join { a: Gc<Bar>, b: Gc<Bar> };
         let join = {
-            let a1 = Gc::new(Bar { b: 0, bar: Gc::empty() });
-            let a2 = Gc::new(Bar { b: 1, bar: Gc::empty() });
-            let a3 = Gc::new(Bar { b: 2, bar: Gc::empty() });
-            a1.set(|a| a.bar = a2.clone());
-            a2.set(|a| a.bar = a3.clone());
-            a3.set(|a| a.bar = a1.clone());
+            let a1 = Gc::new(Bar { b: 0, bar: vec![] });
+            let a2 = Gc::new(Bar { b: 1, bar: vec![] });
+            let a3 = Gc::new(Bar { b: 2, bar: vec![] });
+            a1.set(|a| a.bar = vec![a2.clone()]);
+            a2.set(|a| a.bar = vec![a3.clone()]);
+            a3.set(|a| a.bar = vec![a1.clone()]);
 
-            let b1 = Gc::new(Bar { b: 3, bar: Gc::empty() });
-            let b2 = Gc::new(Bar { b: 4, bar: Gc::empty() });
-            let b3 = Gc::new(Bar { b: 5, bar: Gc::empty() });
-            b1.set(|b| b.bar = b2.clone());
-            b2.set(|b| b.bar = b3.clone());
-            b3.set(|b| b.bar = b1.clone());
+            let b1 = Gc::new(Bar { b: 3, bar: vec![] });
+            let b2 = Gc::new(Bar { b: 4, bar: vec![] });
+            let b3 = Gc::new(Bar { b: 5, bar: vec![] });
+            b1.set(|b| b.bar = vec![b2.clone()]);
+            b2.set(|b| b.bar = vec![b3.clone()]);
+            b3.set(|b| b.bar = vec![b1.clone()]);
 
             Join { a: a1.clone(), b: b1.clone() }
         };
@@ -148,5 +192,6 @@ mod tests {
         println!("2");
         drop(join);
         Collector::yuga();
+        assert_eq!(gc::number_of_live_objects(), 0);
     }
 }

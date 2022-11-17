@@ -16,8 +16,10 @@ use shuttle::thread_local;
 
 #[cfg(not(all(feature = "shuttle", test)))]
 use std::{sync::{Once, Arc, Weak, Mutex, RwLock, RwLockReadGuard, Condvar, atomic::{AtomicUsize, AtomicBool, Ordering}}, thread};
+#[cfg(not(all(feature = "shuttle", test)))]
+use rand;
 #[cfg(all(feature = "shuttle", test))]
-use shuttle::{sync::{*, atomic::{AtomicUsize, AtomicBool, Ordering}}, thread, rand, rand::Rng};
+use shuttle::{sync::{*, atomic::{AtomicUsize, AtomicBool, Ordering}}, thread, rand};
 
 // TODO: see if crossbeam mpmc is faster than std mpsc?
 #[cfg(not(all(feature = "shuttle", test)))]
@@ -150,14 +152,10 @@ impl<'a> Collector<'a> {
                     // XXX: do we also have to check if edge is fine?
                     // if we are a part of the same component as an incoming
                     // edge, then we've found a cycle and break it.
-                    //
-                    // this is definitely wrong - we need to create components
-                    // instead, and then only at the end break cycles of Some(n)
-                    // components.
                     let comp = components.find(Some(*idx));
                     if comp.is_some() && comp == components.find(Some(edge as usize)) {
                         println!("part of cycle");
-                        //gc.0.invalidate();
+                        gc.0.invalidate();
                         break; // ???
                     }
                     components.union(Some(*idx), Some(edge as usize));
@@ -271,10 +269,11 @@ impl<'a> Collector<'a> {
         println!("collection done");
     }
 
-    #[cfg(all(feature = "shuttle", test))]
+    //#[cfg(all(feature = "shuttle", test))]
     /// Randomly trigger a non-blocking collection
     pub fn maybe_yuga() {
-        if rand::thread_rng().gen::<bool>() == false { return ; }
+        use self::rand::Rng;
+        if self::rand::thread_rng().gen::<bool>() == false { return ; }
         let b = Arc::new((Mutex::new(false), Condvar::new()));
         println!("mutator forcing non-blocking collection");
         LOCAL_SENDER.with(|l| l.chan.borrow().as_ref().unwrap().send(Soul::Yuga(b.clone())) ).unwrap();

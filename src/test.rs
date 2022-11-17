@@ -1,5 +1,12 @@
 use crate::gc::{Gc, WeakGc};
 use crate::trace::Trace;
+use crate::gc::number_of_live_objects;
+use crate::collector::Collector;
+
+#[cfg(not(all(feature = "shuttle", test)))]
+use {rand, rand::*};
+
+use rand::*;
 
 #[derive(Debug)]
 struct DirectedGraphNode {
@@ -118,80 +125,86 @@ impl<T: Send + Sync + 'static> Trace for Node<T> {
     }
 }
 
-#[cfg(all(feature = "shuttle", test))]
-mod test {
-    use super::*;
-    use shuttle::rand;
-    use shuttle::rand::*;
-    use crate::gc::number_of_live_objects;
-    use crate::collector::Collector;
+fn choose<T>(vec: &Vec<T>) -> &T {
+    &vec[rand::thread_rng().gen_range(0, vec.len())]
+}
 
-    fn choose<T>(vec: &Vec<T>) -> &T {
-        &vec[rand::thread_rng().gen_range(0, vec.len())]
+fn test_graph() {
+    println!("Creating nodes...");
+    let mut nodes = Vec::new();
+
+    for i in 0..=NODE_COUNT {
+        nodes.push(Gc::new(DirectedGraphNode {
+            label: format!("Node {}", i),
+            edges: Vec::new(),
+        }));
     }
 
-    fn test_graph() {
-        println!("Creating nodes...");
-        let mut nodes = Vec::new();
+    println!("Adding edges...");
+    for i in 0..=EDGE_COUNT {
+        println!("{}", i);
+        let a = choose(&nodes);
+        let b = choose(&nodes);
+        if (a as *const _ as usize) == (b as *const _ as usize) { continue; }
 
-        for i in 0..=NODE_COUNT {
-            nodes.push(Gc::new(DirectedGraphNode {
-                label: format!("Node {}", i),
-                edges: Vec::new(),
-            }));
-        }
-
-        println!("Adding edges...");
-        for i in 0..=EDGE_COUNT {
-            println!("{}", i);
-            let a = choose(&nodes);
-            let b = choose(&nodes);
-            if (a as *const _ as usize) == (b as *const _ as usize) { continue; }
-
-            a.set(|a| a.edges.push(Gc::clone(&b)));
-        }
-
-        println!("Doing the shrink...");
-        for i in 0..NODE_COUNT {
-            println!("shrink {}", i);
-            if i % SHRINK_DIV == 0 {
-                nodes.truncate(NODE_COUNT - i);
-                Collector::yuga();
-                let live = number_of_live_objects();
-                println!("Now have {} datas and {} nodes", live, nodes.len());
-                // TODO: Add an assert here. this isn't correct: objects can
-                // still be alive due to live Weak<T> queued on the channel.
-                //assert_eq!(nodes.len(), live);
-            }
-        }
-        println!("done");
+        a.set(|a| a.edges.push(Gc::clone(&b)));
     }
+
+    println!("Doing the shrink...");
+    for i in 0..NODE_COUNT {
+        println!("shrink {}", i);
+        if i % SHRINK_DIV == 0 {
+            nodes.truncate(NODE_COUNT - i);
+            Collector::yuga();
+            let live = number_of_live_objects();
+            println!("Now have {} datas and {} nodes", live, nodes.len());
+            // TODO: Add an assert here. this isn't correct: objects can
+            // still be alive due to live Weak<T> queued on the channel.
+            //assert_eq!(nodes.len(), live);
+        }
+    }
+    println!("done");
+}
 
 const LIST_COUNT: usize = 1 << 4;
 const ACTION_COUNT: usize = 1 << 4;
-    fn test_list() {
-        println!("Creating list...");
-        let mut list = List::new();
-        for i in 0..=LIST_COUNT {
-            list.push_tail(i);
-        }
-
-        println!("Inserting randomly");
-        for i in 0..ACTION_COUNT {
-            match rand::thread_rng().gen_range(0, 2) {
-                0 => list.get(rand::thread_rng().gen_range(0, list.len)).unlink(&mut list),
-                1 => list.get(rand::thread_rng().gen_range(0, list.len)).link_next(Node::new(i), &mut list),
-                _ => (),
-            }
-            Collector::maybe_yuga();
-        }
-
-        if let Some(head) = list.get_head() {
-            let info = head.get(|n| (n.val, n.next.is_some(), n.prev.is_some()) );
-            println!("{}, next {} prev {}", info.0, info.1, info.2);
-        }
+fn test_list() {
+    println!("Creating list...");
+    let mut list = List::new();
+    for i in 0..=LIST_COUNT {
+        list.push_tail(i);
     }
 
+    println!("Inserting randomly");
+    for i in 0..ACTION_COUNT {
+        match thread_rng().gen_range(0, 2) {
+            0 => list.get(thread_rng().gen_range(0, list.len)).unlink(&mut list),
+            1 => list.get(thread_rng().gen_range(0, list.len)).link_next(Node::new(i), &mut list),
+            _ => (),
+        }
+        Collector::maybe_yuga();
+    }
+
+    if let Some(head) = list.get_head() {
+        let info = head.get(|n| (n.val, n.next.is_some(), n.prev.is_some()) );
+        println!("{}, next {} prev {}", info.0, info.1, info.2);
+    }
+}
+
+#[cfg(not(all(feature = "shuttle", test)))]
+mod test {
+    use super::*;
+
+    #[test]
+    fn normal_test_list() {
+        test_list();
+        Collector::yuga();
+    }
+}
+
+#[cfg(all(feature = "shuttle", test))]
+mod test {
+    use super::*;
     fn exhaustive<F: Fn() + Send + Sync + 'static>(f: F) {
         use shuttle::scheduler::DfsScheduler;
         let dfs = DfsScheduler::new(None, true);
@@ -200,20 +213,31 @@ const ACTION_COUNT: usize = 1 << 4;
         runner.run(f);
     }
 
+    fn random<F: Fn() + Send + Sync + 'static>(f: F, iters: usize) {
+        use shuttle::scheduler::RandomScheduler;
+        let dfs = RandomScheduler::new(iters);
+        let mut config = shuttle::Config::new();
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        let mut runner = shuttle::PortfolioRunner::new(true, config);
+        runner.add(dfs);
+        runner.run(f);
+    }
+
     #[test]
     fn shuttle_test_list() {
-        shuttle::check_random(|| {
+        random(|| {
             test_list();
             Collector::nirvana();
+            assert_eq!(crate::gc::number_of_live_objects(), 0);
         }, 100);
     }
 
     #[test]
     fn shuttle_fail_list() {
-        shuttle::replay_from_file(|| {
+        shuttle::replay(|| {
             test_list();
             Collector::nirvana();
-        }, "./fail");
+        }, "");
     }
 
     #[test]
@@ -225,10 +249,10 @@ const ACTION_COUNT: usize = 1 << 4;
     }
 
     #[test]
-    fn shuttle_failing_schedule() {
+    fn shuttle_fail_graph() {
         shuttle::replay(|| {
             test_graph();
             Collector::nirvana();
-        }, "9101c102c5cdaebadbd0a0bdec010080aa0002000000000000000000000000000000307cf8c3e100202a8202800822802000a0aaaaaaaa820202000000800a00000080aaaa8a8002000008082080a8aaaa8800000000000000000000000000");
+        }, "");
     }
 }

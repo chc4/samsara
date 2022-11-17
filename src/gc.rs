@@ -66,7 +66,7 @@ impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize, Tracke
             // be a mutator, which means the object is still reachable.
             return false;
         };
-        if let Some(reader) = r.as_ref() {
+        let flag = if let Some(reader) = r.as_ref() {
             // We were able to acquire a read-lock, so we know it doesn't have a
             // write-lock outstanding. Now we visit the object to find all reachable
             // Gc<T> objects to add to our worklist.
@@ -78,7 +78,13 @@ impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize, Tracke
             // happen if we already broke a cycle somehow.
             println!("empty weakgc");
             false
-        }
+        };
+        // these drops matter, so make them explicit: in particular upgraded being
+        // dropped may cause T::drop() to be called, since we could upgrade a weak and then
+        // drop the upgraded Arc after the mutator drops its last reference.
+        drop(r);
+        drop(upgraded);
+        flag
     }
 
     fn as_ptr(&self) -> usize {
@@ -229,7 +235,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 LOCAL_SENDER.with(|s| {
                     let rec = try_send(&s.chan.borrow().as_ref().unwrap(), Soul::Reclaimed(ptr as usize));
 
-                    rec.map_err(|e| unimplemented!("sending soul error {:?}", e))
+                    //rec.map_err(|e| unimplemented!("sending soul error {:?}", e))
                 });
             } else {
                 // We know it didn't have a weak count, so wasn't added to
