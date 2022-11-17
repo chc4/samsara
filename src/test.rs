@@ -15,12 +15,14 @@ struct DirectedGraphNode {
 }
 
 impl Trace for DirectedGraphNode {
-
+    fn trace(&self, root: &dyn WeakGc, c: &mut crate::collector::Collector) {
+        self.edges.iter().map(|p| p.trace(root, c)).for_each(drop);
+    }
 }
 
-const NODE_COUNT: usize = 1 << 4;
-const EDGE_COUNT: usize = 1 << 2;
-const SHRINK_DIV: usize = 1 << 2;
+const NODE_COUNT: usize = 1 << 6;
+const EDGE_COUNT: usize = 1 << 4;
+const SHRINK_DIV: usize = 1 << 3;
 
 struct Node<T: Send + Sync + 'static> {
     pub val: T,
@@ -125,6 +127,13 @@ impl<T: Send + Sync + 'static> Trace for Node<T> {
     }
 }
 
+impl<T: Send + Sync + 'static> Trace for List<T> {
+    fn trace(&self, root: &dyn WeakGc, c: &mut crate::collector::Collector) {
+        self.head.as_ref().map(|n| n.trace(root, c));
+        self.tail.as_ref().map(|p| p.trace(root, c));
+    }
+}
+
 fn choose<T>(vec: &Vec<T>) -> &T {
     &vec[rand::thread_rng().gen_range(0, vec.len())]
 }
@@ -145,8 +154,9 @@ fn test_graph() {
         println!("{}", i);
         let a = choose(&nodes);
         let b = choose(&nodes);
-        if (a as *const _ as usize) == (b as *const _ as usize) { continue; }
+        if a.as_ptr() == b.as_ptr() { continue; }
 
+        println!("add edge {:x} -> {:x}", a as *const _ as usize, b as *const _ as usize);
         a.set(|a| a.edges.push(Gc::clone(&b)));
     }
 
@@ -154,7 +164,8 @@ fn test_graph() {
     for i in 0..NODE_COUNT {
         println!("shrink {}", i);
         if i % SHRINK_DIV == 0 {
-            nodes.truncate(NODE_COUNT - i);
+            //nodes.truncate(NODE_COUNT - i);
+            nodes.remove(thread_rng().gen_range(0, nodes.len()));
             Collector::yuga();
             let live = number_of_live_objects();
             println!("Now have {} datas and {} nodes", live, nodes.len());
@@ -199,6 +210,7 @@ mod test {
     fn normal_test_list() {
         test_list();
         Collector::yuga();
+        assert_eq!(crate::gc::number_of_live_objects(), 0);
     }
 }
 
@@ -227,6 +239,7 @@ mod test {
     fn shuttle_test_list() {
         random(|| {
             test_list();
+            Collector::yuga();
             Collector::nirvana();
             assert_eq!(crate::gc::number_of_live_objects(), 0);
         }, 100);
@@ -237,14 +250,16 @@ mod test {
         shuttle::replay(|| {
             test_list();
             Collector::nirvana();
-        }, "");
+        }, "91019a05bfd983e788a4a5fff9010020220000800000020080000000020000000220000002002000000800000800800000200000080000200000020020000020080002800002088000020012404541540011151114151000144091a02a280aa82a02028a80200288880882802288228aa08aa228a02288000282a2082a88288288800aa2a02a022828a888208aaa828aa2a828a208a80a82202a88822882280222280028a00a88288a541115044011001010445400");
     }
 
     #[test]
     fn shuttle_test_graph() {
         shuttle::check_random(|| {
             test_graph();
+            Collector::yuga();
             Collector::nirvana();
+            assert_eq!(crate::gc::number_of_live_objects(), 0);
         }, 100);
     }
 

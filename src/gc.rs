@@ -309,6 +309,7 @@ impl<T: Trace> Gc<T> {
     /// may panic due to attempting to dereference a Gc pointer that has been nullified
     /// in order to break cycles - however, in normal operations, it will not panic.
     pub fn get<F, O>(&self, f: F) -> O where F: Fn(&T) -> O {
+        println!("get on 0x{:x}", self.as_ptr() as usize);
         f(self.item.0.read().unwrap().as_ref().unwrap())
     }
 

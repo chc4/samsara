@@ -194,4 +194,41 @@ mod tests {
         Collector::yuga();
         assert_eq!(gc::number_of_live_objects(), 0);
     }
+
+    fn new(n: usize) -> Gc<Bar> { Gc::new(Bar { b : n, bar: vec![] }) }
+
+    #[test]
+    fn weird() {
+        // a0 -> a1 -> a2 -> a4 -> a5
+        //       a3 -^
+        let a0 = new(0);
+        let a1 = new(1);
+        a0.set(|a| a.bar.push(Gc::clone(&a1)));
+        let a2 = new(2);
+        a1.set(|a| a.bar.push(Gc::clone(&a2)));
+        let a3 = new(3);
+        let a4 = new(4);
+        a3.set(|a| a.bar.push(Gc::clone(&a4)));
+        a1.set(|a| a.bar.push(Gc::clone(&a4)));
+        let a5 = new(5);
+        a4.set(|a| a.bar.push(Gc::clone(&a5)));
+        drop(a0.clone());
+        drop(a1.clone());
+        drop(a2.clone());
+        drop(a3.clone());
+        drop(a4);
+        drop(a5);
+        Collector::yuga();
+        assert_eq!(gc::number_of_live_objects(), 6);
+    }
+
+    #[test]
+    fn self_reference() {
+        let a0 = new(0);
+        a0.set(|a| a.bar.push(Gc::clone(&a0)));
+        drop(a0);
+        Collector::yuga();
+        assert_eq!(gc::number_of_live_objects(), 0);
+    }
+
 }

@@ -101,6 +101,15 @@ impl<'a> Ord for Root<'a> {
     }
 }
 
+enum GraphNode {
+    Unknown,
+    Dead,
+    Live,
+    Dirty,
+    Internal,
+    Cyclic
+}
+
 impl<'a> Collector<'a> {
     fn collect(&mut self) {
         // Create a local scratchpad for visited GC items
@@ -120,6 +129,7 @@ impl<'a> Collector<'a> {
                 let visitable = item.0.visit(self);
                 if !visitable {
                     println!("figure out how to shortcut");
+                    item.0.clear_visited();
                     // probably just clear_visited() on it and then
                     // remove it from both the visited and snapshot sets?
                     // we don't know anything about gc objects reachable from this
@@ -132,45 +142,127 @@ impl<'a> Collector<'a> {
                 break
             }
         }
+
+
         // We've visited all the nodes in our graph! The only possible candidates
         // for cycles are nodes where their initial count == incoming AND they aren't
         // marked DIRTY.
         let mut nodes = self.visited.iter().collect::<Vec<_>>();
         nodes.sort_by_key(|n| n.1.2);
+        let pre_nodes = nodes.clone();
+
         let mut components = UnionFind::<Option<usize>>::new();
+        let mut graph_nodes = vec![];
+        let mut graph_edges = vec![]; // (from, to)
         for (node, (count, incoming, idx)) in nodes.drain(..) {
             let gc = self.deferred.get(node).expect(format!("{:x}", node).as_str());
             let edges = &self.neighbors[*idx];
-            let Some(flags) = gc.0.flags() else { println!("dead"); continue };
+            let Some(flags) = gc.0.flags() else { graph_nodes.push(GraphNode::Dead); continue };
             println!("{:x}:{}:{} ({:?}) - {:?}", node, count, incoming,
                 flags, edges);
             // we have to reset the bitflags for all of our objects, in case they
             // *weren't* dirty.
             gc.0.clear_visited();
-            if count == incoming && !flags.contains(GcFlags::DIRTY) {
+            if flags.contains(GcFlags::DIRTY) {
+                components.union(Some(*idx), None);
+                graph_nodes.push(GraphNode::Dirty);
+            }
+            else if count == incoming {
+                graph_nodes.push(GraphNode::Internal);
+                for edge in edges {
+                    graph_edges.push((edge as usize, *idx));
+                }
                 for edge in edges {
                     // XXX: do we also have to check if edge is fine?
                     // if we are a part of the same component as an incoming
                     // edge, then we've found a cycle and break it.
                     let comp = components.find(Some(*idx));
-                    if comp.is_some() && comp == components.find(Some(edge as usize)) {
-                        println!("part of cycle");
-                        gc.0.invalidate();
-                        break; // ???
+                    let edge_comp = components.find(Some(edge as usize));
+                    if edge_comp.is_none() {
+                        // if we're downstream from a node we know isn't in a cycle,
+                        // we should mark ourselves not part of a cycle also.
+                        components.union(Some(*idx), None);
+                        //break;
+                    }
+                    else if comp.is_some() && comp == edge_comp {
+                        println!("possibly part of cycle");
+                        components.union(Some(*idx), Some(edge as usize));
+                        //break;
                     }
                     components.union(Some(*idx), Some(edge as usize));
                 }
             } else {
                 // we could start tearing down the graph here i guess
+                graph_nodes.push(GraphNode::Live);
                 components.union(Some(*idx), None);
             }
         }
+        assert_eq!(pre_nodes.len(), graph_nodes.len());
+        for component in components.subsets() {
+            if !component.contains(&None) {
+                let mut i = component.iter();
+                while let Some(Some(member)) = i.next() {
+                    graph_nodes[*member] = GraphNode::Cyclic;
+                    println!("invalidating {}", member);
+                    println!("{:?}", self.deferred.keys().collect::<Vec<_>>());
+                    let gc = &self.deferred[pre_nodes[*member].0];
+                    gc.0.invalidate();
+                }
+                //self.draw_graph(pre_nodes, graph_nodes, graph_edges);
+                //panic!("component {:?}", component);
+            }
+        }
+
+        self.draw_graph(pre_nodes, graph_nodes, graph_edges);
         // We can now reset our working sets of objects; possibly-cyclic data
         // from the worker threads will all be added later since it's buffered
         // in the channel while we were working.
         self.visited = Default::default();
-        self.deferred = Default::default();
+        //self.deferred = Default::default();
         self.neighbors = Default::default();
+    }
+
+    #[cfg(feature = "graphviz")]
+    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, usize, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, usize)>) {
+        use graphviz_rust::*;
+        use graphviz_rust::printer::*;
+        use graphviz_rust::cmd::*;
+        use dot_structures::*;
+        use dot_generator::*;
+        let g = graph!(strict di id!("t");
+          subgraph!("x",
+            pre_nodes.iter().flat_map(|(node, (count, incoming, idx))| {
+                let mut edges = self.neighbors[*idx].iter().map(|e| {
+                    Stmt::Edge(edge!(node_id!(e) => node_id!(idx)))
+                }).collect::<Vec<Stmt>>();
+                let color = match &after_nodes[*idx] {
+                    GraphNode::Unknown => "white",
+                    GraphNode::Dead => "grey",
+                    GraphNode::Dirty => "black",
+                    GraphNode::Live => "green",
+                    GraphNode::Internal => "pink",
+                    GraphNode::Cyclic => "red",
+                };
+                let label = format!("\"{} {}:{}\"",
+                    idx,
+                    //self.deferred.get(node).unwrap().0.as_ptr(),
+                    count, incoming);
+                edges.push(Stmt::Node(node!(idx; attr!("color", color), attr!("label", label))));
+                edges
+            }).collect()
+          )
+        );
+
+        let graph_svg = exec(g, &mut PrinterContext::default(), vec![
+            CommandArg::Format(Format::Pdf),
+            CommandArg::Output("./samsara_graph.pdf".to_string())
+        ]).unwrap();
+        println!("outputted graph {}", graph_svg);
+    }
+
+    #[cfg(not(feature = "graphviz"))]
+    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, usize, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, usize)>) {
+        // noop
     }
 
     pub fn add_node(&mut self, root: &dyn WeakGc) -> bool {
@@ -189,7 +281,9 @@ impl<'a> Collector<'a> {
             let idx = self.neighbors.len();
             self.neighbors.push(RoaringBitmap::new());
             novel = true;
-            (root.strong_count(), 0, idx)
+            let strong_count = root.strong_count();
+            println!("object {} has strong_count {}", root.as_ptr(), strong_count);
+            (strong_count, 0, idx)
         });
         // it's probably useful to be able to tell if we are first seeing a node
         // or not...? i can't think of for what right now, though
@@ -203,7 +297,7 @@ impl<'a> Collector<'a> {
             e.1 += 1
         }).or_insert_with(|| panic!() ).2;
         // add the reverse edge to our graph
-        self.neighbors[self.visited.get(&item.as_ptr()).unwrap().2].insert(root_idx as u32);
+        self.neighbors[root_idx].insert(self.visited.get(&item.as_ptr()).unwrap().2 as u32);
     }
 
     fn process(&mut self, receiver: Receiver<Soul>) {
