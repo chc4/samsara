@@ -102,6 +102,7 @@ mod tests {
         println!("3");
         drop(a3);
         Collector::yuga();
+        assert_eq!(gc::number_of_live_objects(), 0);
     }
 
     #[test]
@@ -220,6 +221,16 @@ mod tests {
         drop(a5);
         Collector::yuga();
         assert_eq!(gc::number_of_live_objects(), 6);
+    }
+
+    #[test]
+    fn two_edges() {
+        let a0 = new(0);
+        let a1 = new(1);
+        a0.set(|a|{ a.bar.push(Gc::clone(&a1)); a.bar.push(Gc::clone(&a1)); });
+        drop(a1);
+        Collector::yuga();
+        assert_eq!(gc::number_of_live_objects(), 1);
     }
 
     #[test]

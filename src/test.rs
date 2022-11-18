@@ -3,10 +3,11 @@ use crate::trace::Trace;
 use crate::gc::number_of_live_objects;
 use crate::collector::Collector;
 
-#[cfg(not(all(feature = "shuttle", test)))]
-use {rand, rand::*};
+//#[cfg(not(all(feature = "shuttle", test)))]
+//use {rand, rand::*};
 
-use rand::*;
+#[cfg(all(feature = "shuttle", test))]
+use shuttle::{rand, rand::*};
 
 #[derive(Debug)]
 struct DirectedGraphNode {
@@ -40,6 +41,7 @@ impl<T: Send + Sync + 'static> Gc<Node<T>> {
     /// Set node to the next link in the list containing self
     fn link_next(&self, mut node: Node<T>, list: &mut List<T>) {
         let node = if let Some(curr_next) = self.get(|s| s.next.clone() ) {
+            assert!(curr_next.as_ptr() != self.as_ptr(), "self-reference");
             node.next = Some(curr_next.clone());
 
             let mut node = Gc::new(node);
@@ -135,7 +137,7 @@ impl<T: Send + Sync + 'static> Trace for List<T> {
 }
 
 fn choose<T>(vec: &Vec<T>) -> &T {
-    &vec[rand::thread_rng().gen_range(0, vec.len())]
+    &vec[self::rand::thread_rng().gen_range(0, vec.len())]
 }
 
 fn test_graph() {
@@ -178,7 +180,7 @@ fn test_graph() {
 }
 
 const LIST_COUNT: usize = 1 << 4;
-const ACTION_COUNT: usize = 1 << 4;
+const ACTION_COUNT: usize = 1 << 1;
 fn test_list() {
     println!("Creating list...");
     let mut list = List::new();
@@ -189,7 +191,7 @@ fn test_list() {
     println!("Inserting randomly");
     for i in 0..ACTION_COUNT {
         match thread_rng().gen_range(0, 2) {
-            0 => list.get(thread_rng().gen_range(0, list.len)).unlink(&mut list),
+            //0 => list.get(thread_rng().gen_range(0, list.len)).unlink(&mut list),
             1 => list.get(thread_rng().gen_range(0, list.len)).link_next(Node::new(i), &mut list),
             _ => (),
         }
@@ -249,8 +251,10 @@ mod test {
     fn shuttle_fail_list() {
         shuttle::replay(|| {
             test_list();
+            Collector::yuga();
             Collector::nirvana();
-        }, "91019a05bfd983e788a4a5fff9010020220000800000020080000000020000000220000002002000000800000800800000200000080000200000020020000020080002800002088000020012404541540011151114151000144091a02a280aa82a02028a80200288880882802288228aa08aa228a02288000282a2082a88288288800aa2a02a022828a888208aaa828aa2a828a208a80a82202a88822882280222280028a00a88288a541115044011001010445400");
+            assert_eq!(crate::gc::number_of_live_objects(), 0);
+        }, "9101a607afebcb97a7b1e49c56000a0008008000002000000200800000800000200080000020000008000002000000002200000002002000000800f0bf20a0a2080a0a02208020028aa222aa8002808880a8a08282002a800aa002a8a020a81211550140144051555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555515400000");
     }
 
     #[test]

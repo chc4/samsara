@@ -217,7 +217,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
             return drop(&mut self.item);
         }
         // See [Defer List]
-        if Arc::strong_count(&self.item) == 1 {
+        if Arc::strong_count(&self.item) <= 1 {
             // We know we are the only thread to have a reference to this item.
             if Arc::weak_count(&self.item) != 0 {
                 // Something has a weak reference to this object; there's a good

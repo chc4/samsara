@@ -16,8 +16,9 @@ use shuttle::thread_local;
 
 #[cfg(not(all(feature = "shuttle", test)))]
 use std::{sync::{Once, Arc, Weak, Mutex, RwLock, RwLockReadGuard, Condvar, atomic::{AtomicUsize, AtomicBool, Ordering}}, thread};
-#[cfg(not(all(feature = "shuttle", test)))]
-use rand;
+//#[cfg(not(all(feature = "shuttle", test)))]
+//use rand;
+
 #[cfg(all(feature = "shuttle", test))]
 use shuttle::{sync::{*, atomic::{AtomicUsize, AtomicBool, Ordering}}, thread, rand};
 
@@ -294,6 +295,9 @@ impl<'a> Collector<'a> {
         println!("got edge {:x}->{:x}", root.as_ptr(), item.as_ptr());
         let root_idx = self.visited.entry(root.as_ptr()).and_modify(|e| {
             // TODO: do we need incoming edge count now that we have adjacency lists?
+            // TODO: think if this is the test_list problem - object with two edges
+            // to an object should have strong_count = 2 but we should also find
+            // two edges when visiting so should be fine?
             e.1 += 1
         }).or_insert_with(|| panic!() ).2;
         // add the reverse edge to our graph
