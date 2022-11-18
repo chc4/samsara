@@ -205,7 +205,7 @@ impl<'a> Collector<'a> {
                 let mut i = component.iter();
                 while let Some(Some(member)) = i.next() {
                     graph_nodes[*member] = GraphNode::Cyclic;
-                    println!("invalidating {}", member);
+                    dbg!("invalidating {}", member);
                     println!("{:?}", self.deferred.keys().collect::<Vec<_>>());
                     let gc = &self.deferred[pre_nodes[*member].0];
                     gc.0.invalidate();
@@ -220,7 +220,7 @@ impl<'a> Collector<'a> {
         // from the worker threads will all be added later since it's buffered
         // in the channel while we were working.
         self.visited = Default::default();
-        //self.deferred = Default::default();
+        self.deferred = Default::default();
         self.neighbors = Default::default();
     }
 
@@ -285,7 +285,6 @@ impl<'a> Collector<'a> {
             self.neighbors.push(RoaringBitmap::new());
             novel = true;
             let strong_count = root.strong_count();
-            println!("object {:x} has strong_count {}", root.as_ptr(), strong_count);
             (strong_count, idx)
         });
         // it's probably useful to be able to tell if we are first seeing a node
@@ -323,9 +322,6 @@ impl<'a> Collector<'a> {
                 },
                 Soul::Yuga(b) => {
                     println!("triggering yuga");
-                    for root in &self.deferred {
-                        println!("DEFERRED ROOT 0x{:x} HAS STRONG_COUNT {}", root.0, root.1.0.strong_count());
-                    }
                     self.collect();
                     // signal to all listeners that the yuga ended
                     *b.0.lock().unwrap() = true;

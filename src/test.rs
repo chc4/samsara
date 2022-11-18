@@ -43,28 +43,18 @@ impl<T: Send + Sync + 'static> Node<T> {
 impl<T: Send + Sync + 'static> Gc<Node<T>> {
     /// Set node to the next link in the list containing self
     fn link_next(&self, mut node: Node<T>, list: &mut List<T>) {
-        println!("1");
         let node = if let Some(curr_next) = self.get(|s| s.next.clone() ) {
-            println!("2");
             assert!(curr_next.as_ptr() != self.as_ptr(), "self-reference");
-            println!("3");
             node.next = Some(curr_next.clone());
-            println!("4");
-            // why does this cause leaks
-            //node.prev = Some(self.clone());
+            node.prev = Some(self.clone());
 
             let mut node = Gc::new(node);
-            println!("5");
             curr_next.set(|n| n.prev = Some(node.clone()) );
-            println!("6");
             node
         } else {
-            println!("7");
             Gc::new(node)
         };
-        println!("8");
         self.set(|s| s.next = Some(node.clone()));
-        println!("9");
         list.len += 1;
     }
 
@@ -168,12 +158,13 @@ fn test_graph() {
     println!("Adding edges...");
     for i in 0..=EDGE_COUNT {
         println!("{}", i);
+        Collector::maybe_yuga();
         let a = choose(&nodes);
         let b = choose(&nodes);
         if a.as_ptr() == b.as_ptr() { continue; }
 
         println!("add edge {:x} -> {:x}", a as *const _ as usize, b as *const _ as usize);
-        a.set(|a| a.edges.push(Gc::clone(&b)));
+        a.set(|a|{ Collector::maybe_yuga(); a.edges.push(Gc::clone(&b)) });
     }
 
     println!("Doing the shrink...");
@@ -182,9 +173,13 @@ fn test_graph() {
         if i % SHRINK_DIV == 0 {
             //nodes.truncate(NODE_COUNT - i);
             nodes.remove(self::rand::thread_rng().gen_range(0, nodes.len()));
-            Collector::yuga();
+            Collector::maybe_yuga();
             let live = number_of_live_objects();
             println!("Now have {} datas and {} nodes", live, nodes.len());
+            for node in &nodes {
+                let label = node.get(|n| n.label.len() );
+                assert_ne!(label, 0);
+            }
             // TODO: Add an assert here. this isn't correct: objects can
             // still be alive due to live Weak<T> queued on the channel.
             //assert_eq!(nodes.len(), live);
