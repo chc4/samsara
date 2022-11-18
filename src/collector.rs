@@ -1,5 +1,5 @@
 use crate::trace::Trace;
-use crate::gc::{Gc, WeakGc, GcFlags};
+use crate::gc::{Gc, WeakRoot, GcFlags};
 use crate::tracker::{Tracker, TrackerLocation};
 
 use std::cell::{RefCell, Cell};
@@ -28,11 +28,60 @@ pub use std::sync::mpsc::{Sender, Receiver, sync_channel, SyncSender};
 #[cfg(all(feature = "shuttle", test))]
 pub use shuttle::sync::mpsc::{Sender, Receiver, sync_channel, SyncSender};
 
-struct Root<'a>(Rc<dyn WeakGc>, PhantomData<&'a ()>);
+struct Root<'a>(WeakRoot, PhantomData<&'a ()>);
+
+impl<'a> Root<'a> {
+    fn visit(&self, c: &mut Collector) -> bool {
+        // When we visit a Weak<GcObject> from our defer list root, we have to
+        // acquire a read-lock. This is because there could be a sequence
+        // of A->B->C->D references from our root A to another Gc<T> D, and
+        // we have to be able to visit through to D without it being deallocated
+        // in the meanwhile.
+        // While we hold a read-lock no mutator thread is able to acquire a new
+        // write-lock! This will occasionally pause mutator threads, but is
+        // still better than a full stop-the-world phase. We also simply immediately
+        // skip tracing a root if we can't acquire a read-lock, which means
+        // a mutator thread is currently holding a write-lock and thus the object
+        // is definitely still reachable.
+        let Some(upgraded) = self.0.0.upgrade() else {
+            // we couldn't upgrade the weak reference, so it was a dead root object
+            println!("visited dead weakgc");
+            return false;
+        };
+        upgraded.read_and_trace(&self.0, c)
+//        let Ok(r) = upgraded.try_read() else {
+//            println!("can't acquire read-lock on weakgc");
+//            // We couldn't acquire a read-lock, so we know *something* else has
+//            // an outstanding lock. The collector doesn't hold guards, so it must
+//            // be a mutator, which means the object is still reachable.
+//            return false;
+//        };
+//        let flag = if let Some(reader) = r.as_ref() {
+//            // We were able to acquire a read-lock, so we know it doesn't have a
+//            // write-lock outstanding. Now we visit the object to find all reachable
+//            // Gc<T> objects to add to our worklist.
+//            println!("started tracing weakgc 0x{:x}", self.0.as_ptr() as usize);
+//            reader.trace(self, c);
+//            true
+//        } else {
+//            // we got a read-lock, but the object is None - this should only
+//            // happen if we already broke a cycle somehow.
+//            println!("empty weakgc");
+//            false
+//        };
+//        // these drops matter, so make them explicit: in particular upgraded being
+//        // dropped may cause T::drop() to be called, since we could upgrade a weak and then
+//        // drop the upgraded Arc after the mutator drops its last reference.
+//        drop(r);
+//        drop(upgraded);
+//        flag
+    }
+}
+
 
 impl<'a> Clone for Root<'a> {
     fn clone(&self) -> Self {
-        Root(self.0.clone(), PhantomData)
+        Root(WeakRoot(self.0.0.clone()), PhantomData)
     }
 }
 
@@ -77,7 +126,7 @@ pub struct Collector<'a> {
 
 impl<'a> PartialEq for Root<'a> {
     fn eq(&self, rhs: &Self) -> bool {
-        self.0.as_ptr() == rhs.0.as_ptr()
+        self.0.0.as_ptr() == rhs.0.0.as_ptr()
     }
 }
 
@@ -86,19 +135,19 @@ impl<'a> Eq for Root<'a> {
 
 impl<'a> core::hash::Hash for Root<'a> {
     fn hash<H>(&self, hasher: &mut H) where H: core::hash::Hasher {
-        hasher.write_usize(self.0.as_ptr())
+        hasher.write_usize(self.0.0.as_ptr() as *const () as usize)
     }
 }
 
 impl<'a> PartialOrd for Root<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.as_ptr().partial_cmp(&self.0.as_ptr())
+        self.0.0.as_ptr().partial_cmp(&self.0.0.as_ptr())
     }
 }
 
 impl<'a> Ord for Root<'a> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.as_ptr().cmp(&self.0.as_ptr())
+        self.0.0.as_ptr().cmp(&self.0.0.as_ptr())
     }
 }
 
@@ -126,7 +175,7 @@ impl<'a> Collector<'a> {
                     im::ordmap::DiffItem::Remove(o, i) => { println!("REMOVED"); i },
                 };
                 println!("-- collection visiting 0x{:x}", item.0.as_ptr());
-                self.add_node(&*item.0);
+                self.add_node(item.0.clone());
                 let visitable = item.0.visit(self);
                 if !visitable {
                     println!("figure out how to shortcut");
@@ -184,12 +233,12 @@ impl<'a> Collector<'a> {
                         // if we're downstream from a node we know isn't in a cycle,
                         // we should mark ourselves not part of a cycle also.
                         components.union(Some(*idx), None);
-                        //break;
+                        break;
                     }
                     else if comp.is_some() && comp == edge_comp {
                         println!("possibly part of cycle");
                         components.union(Some(*idx), Some(edge as usize));
-                        //break;
+                        break;
                     }
                     components.union(Some(*idx), Some(edge as usize));
                 }
@@ -205,7 +254,7 @@ impl<'a> Collector<'a> {
                 let mut i = component.iter();
                 while let Some(Some(member)) = i.next() {
                     graph_nodes[*member] = GraphNode::Cyclic;
-                    dbg!("invalidating {}", member);
+                    println!("invalidating {}", member);
                     println!("{:?}", self.deferred.keys().collect::<Vec<_>>());
                     let gc = &self.deferred[pre_nodes[*member].0];
                     gc.0.invalidate();
@@ -268,7 +317,7 @@ impl<'a> Collector<'a> {
         // noop
     }
 
-    pub fn add_node(&mut self, root: &dyn WeakGc) -> bool {
+    pub fn add_node(&mut self, root: WeakRoot) -> bool {
         if root.as_ptr() == 0 { panic!() }
         let mut novel = false;
         self.visited.entry(root.as_ptr()).or_insert_with(|| {
@@ -279,12 +328,12 @@ impl<'a> Collector<'a> {
             println!("got new node {:x}", root.as_ptr());
             root.mark_visited();
             self.deferred.entry(root.as_ptr()).or_insert_with(|| {
-                Root(root.realloc(), PhantomData)
+                Root(root.clone(), PhantomData)
             });
             let idx = self.neighbors.len();
             self.neighbors.push(RoaringBitmap::new());
             novel = true;
-            let strong_count = root.strong_count();
+            let strong_count = root.0.strong_count();
             (strong_count, idx)
         });
         // it's probably useful to be able to tell if we are first seeing a node
@@ -292,7 +341,7 @@ impl<'a> Collector<'a> {
         novel
     }
 
-    pub fn add_edge(&mut self, root: &dyn WeakGc, item: &dyn WeakGc) {
+    pub fn add_edge(&mut self, root: &WeakRoot, item: WeakRoot) {
         println!("got edge {:x}->{:x}", root.as_ptr(), item.as_ptr());
         let root_idx = self.visited.entry(root.as_ptr()).or_insert_with(|| panic!() ).1;
         // add the reverse edge to our graph
@@ -311,7 +360,7 @@ impl<'a> Collector<'a> {
                             println!("got possibly-cyclic object 0x{:x}", ptr);
                             self.deferred.entry(d.as_ptr()).or_insert_with(|| {
                                 println!("inserting");
-                                Root(d.realloc(), PhantomData)
+                                Root(d, PhantomData)
                             });
                         }
                     }
@@ -393,7 +442,7 @@ impl<'a> Collector<'a> {
 pub enum Soul {
     /// A possibly-cyclic object died, and must be added to the defer list for
     /// cycle checking later.
-    Died(Box<dyn WeakGc>),
+    Died(WeakRoot),
     /// An object died, and it definitely wasn't cyclic, but may have been added
     /// to the defer list and should be removed if so.
     Reclaimed(usize /* *const () */),

@@ -2,12 +2,11 @@ use crate::trace::Trace;
 use crate::collector::{Collector, Soul, LOCAL_SENDER, SyncSender};
 
 use std::error::Error;
-use std::rc::Rc;
 
 #[cfg(not(all(feature = "shuttle", test)))]
-use std::{thread, sync::{atomic::*, Arc, Weak, RwLock, RwLockReadGuard, RwLockWriteGuard}};
+pub use std::{thread, sync::{atomic::*, Arc, Weak, RwLock, RwLockReadGuard, RwLockWriteGuard}};
 #[cfg(all(feature = "shuttle", test))]
-use shuttle::{thread, sync::{atomic::*, Arc, Weak, RwLock, RwLockReadGuard, RwLockWriteGuard}};
+pub use shuttle::{thread, sync::{atomic::*, Arc, Weak, RwLock, RwLockReadGuard, RwLockWriteGuard}};
 
 use crate::tracker::{Tracker, TrackerLocation};
 
@@ -30,19 +29,19 @@ pub struct Gc<T: Trace + 'static> {
     item: Arc<(RwLock<Option<T>>, AtomicUsize, Tracker)>
 }
 
-pub trait WeakGc: Send {
-    fn visit(&self, c: &mut Collector) -> bool;
-    fn as_ptr(&self) -> usize;
-    fn strong_count(&self) -> usize;
-    fn root(&self) -> Box<dyn WeakGc>;
-    fn clear_visited(&self);
-    fn mark_visited(&self);
+pub trait GcObject: Send + Sync {
+    fn read_and_trace(&self, _root: &WeakRoot, c: &mut Collector) -> bool;
     fn flags(&self) -> Option<GcFlags>;
-    fn realloc(&self) -> std::rc::Rc<dyn WeakGc>;
+    fn mark_visited(&self);
+    fn clear_visited(&self);
     fn invalidate(&self);
 }
-impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize, Tracker)> {
-    fn visit(&self, c: &mut Collector) -> bool {
+
+#[derive(Clone)]
+pub struct WeakRoot(pub(crate) Weak<dyn GcObject>);
+
+impl WeakRoot {
+    pub fn visit(&self, c: &mut Collector) -> bool {
         // When we visit a WeakGc object from our defer list root, we have to
         // acquire a read-lock. This is because there could be a sequence
         // of A->B->C->D references from our root A to another Gc<T> D, and
@@ -54,12 +53,46 @@ impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize, Tracke
         // skip tracing a root if we can't acquire a read-lock, which means
         // a mutator thread is currently holding a write-lock and thus the object
         // is definitely still reachable.
-        let Some(upgraded) = self.upgrade() else {
+        let Some(upgraded) = self.0.upgrade() else {
             // we couldn't upgrade the weak reference, so it was a dead root object
             println!("visited dead weakgc");
             return false;
         };
-        let Ok(r) = upgraded.0.try_read() else {
+        upgraded.read_and_trace(self, c)
+    }
+
+    pub fn as_ptr(&self) -> usize {
+        self.0.as_ptr() as *const () as usize
+    }
+
+    pub fn flags(&self) -> Option<GcFlags> {
+        println!("FLAGS");
+        //self.0.upgrade().map(|s| s.0.load(Ordering::Acquire) ).and_then(GcFlags::from_bits)
+        self.0.upgrade().and_then(|s| s.flags())
+    }
+
+    pub fn mark_visited(&self) {
+        println!("MARK VISIT {:x}", self.0.as_ptr() as *const () as usize);
+        //self.0.upgrade().map(|s| s.0.store(GcFlags::VISITED.bits(), Ordering::Release));
+        self.0.upgrade().map(|s| s.mark_visited());
+    }
+
+    pub fn clear_visited(&self) {
+        println!("CLEAR VISIT");
+        //self.0.upgrade().map(|s| s.0.store(GcFlags::NONE.bits(), Ordering::Release));
+        self.0.upgrade().map(|s| s.clear_visited());
+    }
+
+    pub fn invalidate(&self) {
+        println!("INVALIDATE");
+        //self.0.upgrade().map(|s| s.2.invalidate() );
+        self.0.upgrade().map(|s| s.invalidate());
+    }
+}
+
+impl<T: Trace> GcObject for (RwLock<Option<T>>, AtomicUsize, Tracker) {
+    fn read_and_trace(&self, _self: &WeakRoot, c: &mut Collector) -> bool {
+        let Ok(r) = self.0.try_read() else {
             println!("can't acquire read-lock on weakgc");
             // We couldn't acquire a read-lock, so we know *something* else has
             // an outstanding lock. The collector doesn't hold guards, so it must
@@ -70,8 +103,8 @@ impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize, Tracke
             // We were able to acquire a read-lock, so we know it doesn't have a
             // write-lock outstanding. Now we visit the object to find all reachable
             // Gc<T> objects to add to our worklist.
-            println!("started tracing weakgc 0x{:x}", self.as_ptr() as usize);
-            reader.trace(self, c);
+            println!("started tracing weakgc 0x{:x}", _self.as_ptr() as usize);
+            reader.trace(_self, c);
             true
         } else {
             // we got a read-lock, but the object is None - this should only
@@ -83,44 +116,23 @@ impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize, Tracke
         // dropped may cause T::drop() to be called, since we could upgrade a weak and then
         // drop the upgraded Arc after the mutator drops its last reference.
         drop(r);
-        drop(upgraded);
         flag
     }
 
-    fn as_ptr(&self) -> usize {
-        self.as_ptr() as usize
-    }
-
-    fn strong_count(&self) -> usize {
-        self.strong_count()
-    }
-
     fn flags(&self) -> Option<GcFlags> {
-        println!("FLAGS");
-        self.upgrade().map(|s| s.1.load(Ordering::Acquire) ).and_then(GcFlags::from_bits)
+        GcFlags::from_bits(self.1.load(Ordering::Acquire))
     }
 
     fn mark_visited(&self) {
-        println!("MARK VISIT {:x}", self.as_ptr() as usize);
-        self.upgrade().map(|s| s.1.store(GcFlags::VISITED.bits(), Ordering::Release));
+        self.1.store(GcFlags::VISITED.bits(), Ordering::Release);
     }
 
     fn clear_visited(&self) {
-        println!("CLEAR VISIT");
-        self.upgrade().map(|s| s.1.store(GcFlags::NONE.bits(), Ordering::Release));
-    }
-
-    fn root(&self) -> Box<dyn WeakGc> {
-        Box::new(self.clone()) as Box<dyn WeakGc + Send>
-    }
-
-    fn realloc(&self) -> Rc<dyn WeakGc> {
-        Rc::new(self.clone()) as Rc<dyn WeakGc>
+        self.1.store(GcFlags::NONE.bits(), Ordering::Release);
     }
 
     fn invalidate(&self) {
-        println!("INVALIDATE");
-        self.upgrade().map(|s| s.0.write().unwrap().take() );
+        self.0.write().unwrap().take();
     }
 }
 
@@ -131,21 +143,23 @@ impl<T: Trace> Clone for Gc<T> {
     }
 }
 
-impl<T: Trace> Trace for Gc<T> {
-    fn trace(&self, root: &dyn WeakGc, c: &mut Collector) {
+impl<T: Trace> Trace for Gc<T> where (RwLock<Option<T>>, AtomicUsize, Tracker): GcObject {
+    fn trace(&self, root: &WeakRoot, c: &mut Collector) {
         // We only trace Gc<T> objects as objects reachable from a WeakGc root,
         // never as the entry-point.
         // if the root is the same as a reachable object, it's just a self-loop.
-        if Arc::as_ptr(&self.item) as usize == root.as_ptr() { unimplemented!("what do we do here?") }
+        if Arc::as_ptr(&self.item) as usize == root.0.as_ptr() as *const () as usize {
+            unimplemented!("what do we do here?")
+        }
 
         // Else get a weak reference to the object, and add it to the graph and
         // an edge from root->self.
         if (self.item.1.load(Ordering::Acquire) & GcFlags::VISITED.bits()) == 0 {
             // TODO: this could probably be more efficient - there's no reason
             // to make a weak ref if the item is already in the node map...
-            c.add_node(&Arc::downgrade(&self.item));
+            c.add_node(WeakRoot(Arc::downgrade(&self.item) as Weak<_> as Weak<dyn GcObject>));
         }
-        c.add_edge(root, &Arc::downgrade(&self.item));
+        c.add_edge(root, WeakRoot(Arc::downgrade(&self.item) as Weak<_> as Weak<dyn GcObject>));
     }
 }
 
@@ -278,7 +292,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 // so that it is a candidate for collection *next* cycle.
             }
             LOCAL_SENDER.with(|s| {
-                let weak = Arc::downgrade(&self.item).root();
+                let weak = Arc::downgrade(&self.item);
                 // this may block, blocking mutator thread! this can happen if
                 // the collector thread is processing too many recvs from too many
                 // threads and can't keep up with bandwidth, or if its busy doing
@@ -287,7 +301,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 // some of this could be made better by queuing work per-thread
                 // that we can clear via Reclaimed if the collector is doing a
                 // collection.
-                s.chan.borrow().as_ref().unwrap().send(Soul::Died(weak))
+                s.chan.borrow().as_ref().unwrap().send(Soul::Died(WeakRoot(weak)))
             });
         }
         drop(&mut self.item)

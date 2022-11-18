@@ -1,4 +1,4 @@
-use crate::gc::{Gc, WeakGc};
+use crate::gc::{Gc, WeakRoot};
 use crate::trace::Trace;
 use crate::gc::number_of_live_objects;
 use crate::collector::Collector;
@@ -19,7 +19,7 @@ struct DirectedGraphNode {
 }
 
 impl Trace for DirectedGraphNode {
-    fn trace(&self, root: &dyn WeakGc, c: &mut crate::collector::Collector) {
+    fn trace(&self, root: &WeakRoot, c: &mut crate::collector::Collector) {
         self.edges.iter().map(|p| p.trace(root, c)).for_each(drop);
     }
 }
@@ -127,14 +127,14 @@ impl<T: Send + Sync + 'static> List<T> {
 }
 
 impl<T: Send + Sync + 'static> Trace for Node<T> {
-    fn trace(&self, root: &dyn WeakGc, c: &mut crate::collector::Collector) {
+    fn trace(&self, root: &WeakRoot, c: &mut crate::collector::Collector) {
         self.next.as_ref().map(|n| n.trace(root, c));
         self.prev.as_ref().map(|p| p.trace(root, c));
     }
 }
 
 impl<T: Send + Sync + 'static> Trace for List<T> {
-    fn trace(&self, root: &dyn WeakGc, c: &mut crate::collector::Collector) {
+    fn trace(&self, root: &WeakRoot, c: &mut crate::collector::Collector) {
         self.head.as_ref().map(|n| n.trace(root, c));
         self.tail.as_ref().map(|p| p.trace(root, c));
     }

@@ -11,7 +11,7 @@ pub fn add(left: usize, right: usize) -> usize {
 #[cfg(not(all(feature = "shuttle", test)))]
 mod tests {
     use super::*;
-    use gc::{Gc, WeakGc};
+    use gc::{Gc, WeakRoot};
     use collector::Collector;
     use trace::Trace;
 
@@ -24,7 +24,7 @@ mod tests {
     }
 
     impl Trace for Foo {
-        fn trace(&self, root: &dyn WeakGc, c: &mut Collector) {
+        fn trace(&self, root: &WeakRoot, c: &mut Collector) {
             self.bar.trace(root, c);
             self.foo1.trace(root, c);
             self.foo2.trace(root, c);
@@ -38,7 +38,7 @@ mod tests {
     }
 
     impl Trace for Bar {
-        fn trace(&self, root: &dyn WeakGc, c: &mut Collector) {
+        fn trace(&self, root: &WeakRoot, c: &mut Collector) {
             println!("trace {}", self.b);
             self.bar.iter().map(|e| e.trace(root, c)).for_each(drop);
         }
