@@ -9,6 +9,9 @@ use crate::collector::Collector;
 #[cfg(all(feature = "shuttle", test))]
 use shuttle::{rand, rand::*};
 
+#[cfg(not(all(feature = "shuttle", test)))]
+use {rand, rand::*};
+
 #[derive(Debug)]
 struct DirectedGraphNode {
     label: String,
@@ -167,7 +170,7 @@ fn test_graph() {
         println!("shrink {}", i);
         if i % SHRINK_DIV == 0 {
             //nodes.truncate(NODE_COUNT - i);
-            nodes.remove(thread_rng().gen_range(0, nodes.len()));
+            nodes.remove(self::rand::thread_rng().gen_range(0, nodes.len()));
             Collector::yuga();
             let live = number_of_live_objects();
             println!("Now have {} datas and {} nodes", live, nodes.len());
@@ -190,9 +193,9 @@ fn test_list() {
 
     println!("Inserting randomly");
     for i in 0..ACTION_COUNT {
-        match thread_rng().gen_range(0, 2) {
+        match self::rand::thread_rng().gen_range(0, 2) {
             //0 => list.get(thread_rng().gen_range(0, list.len)).unlink(&mut list),
-            1 => list.get(thread_rng().gen_range(0, list.len)).link_next(Node::new(i), &mut list),
+            1 => list.get(self::rand::thread_rng().gen_range(0, list.len)).link_next(Node::new(i), &mut list),
             _ => (),
         }
         Collector::maybe_yuga();

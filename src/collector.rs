@@ -16,8 +16,8 @@ use shuttle::thread_local;
 
 #[cfg(not(all(feature = "shuttle", test)))]
 use std::{sync::{Once, Arc, Weak, Mutex, RwLock, RwLockReadGuard, Condvar, atomic::{AtomicUsize, AtomicBool, Ordering}}, thread};
-//#[cfg(not(all(feature = "shuttle", test)))]
-//use rand;
+#[cfg(not(all(feature = "shuttle", test)))]
+use rand;
 
 #[cfg(all(feature = "shuttle", test))]
 use shuttle::{sync::{*, atomic::{AtomicUsize, AtomicBool, Ordering}}, thread, rand};
