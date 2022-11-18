@@ -18,11 +18,17 @@ impl TrackerLocation {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub struct Tracker {
     loc: &'static TrackerLocation
 }
 
+#[cfg(not(test))]
+#[derive(Debug)]
+pub struct Tracker();
+
+#[cfg(test)]
 impl Drop for Tracker {
     fn drop(&mut self) {
         // atomically decrement object count
@@ -30,6 +36,7 @@ impl Drop for Tracker {
     }
 }
 
+#[cfg(test)]
 impl Tracker {
     pub fn of(loc: &'static TrackerLocation) -> Self {
         Self::gain(loc);
@@ -60,6 +67,23 @@ impl Tracker {
         }
     }
 }
+
+#[cfg(not(test))]
+impl Tracker {
+    pub fn of(loc: &'static TrackerLocation) -> Self {
+        Tracker()
+    }
+
+    pub fn get(&self) -> usize {
+        0
+    }
+
+    fn gain(loc: &'static TrackerLocation) {
+    }
+    fn lose(loc: &'static TrackerLocation) {
+    }
+}
+
 
 
 

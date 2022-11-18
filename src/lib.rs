@@ -2,6 +2,7 @@ mod trace;
 mod gc;
 mod collector;
 mod tracker;
+#[cfg(test)]
 mod test;
 
 pub fn add(left: usize, right: usize) -> usize {

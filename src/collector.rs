@@ -30,55 +30,6 @@ pub use shuttle::sync::mpsc::{Sender, Receiver, sync_channel, SyncSender};
 
 struct Root<'a>(WeakRoot, PhantomData<&'a ()>);
 
-impl<'a> Root<'a> {
-    fn visit(&self, c: &mut Collector) -> bool {
-        // When we visit a Weak<GcObject> from our defer list root, we have to
-        // acquire a read-lock. This is because there could be a sequence
-        // of A->B->C->D references from our root A to another Gc<T> D, and
-        // we have to be able to visit through to D without it being deallocated
-        // in the meanwhile.
-        // While we hold a read-lock no mutator thread is able to acquire a new
-        // write-lock! This will occasionally pause mutator threads, but is
-        // still better than a full stop-the-world phase. We also simply immediately
-        // skip tracing a root if we can't acquire a read-lock, which means
-        // a mutator thread is currently holding a write-lock and thus the object
-        // is definitely still reachable.
-        let Some(upgraded) = self.0.0.upgrade() else {
-            // we couldn't upgrade the weak reference, so it was a dead root object
-            println!("visited dead weakgc");
-            return false;
-        };
-        upgraded.read_and_trace(&self.0, c)
-//        let Ok(r) = upgraded.try_read() else {
-//            println!("can't acquire read-lock on weakgc");
-//            // We couldn't acquire a read-lock, so we know *something* else has
-//            // an outstanding lock. The collector doesn't hold guards, so it must
-//            // be a mutator, which means the object is still reachable.
-//            return false;
-//        };
-//        let flag = if let Some(reader) = r.as_ref() {
-//            // We were able to acquire a read-lock, so we know it doesn't have a
-//            // write-lock outstanding. Now we visit the object to find all reachable
-//            // Gc<T> objects to add to our worklist.
-//            println!("started tracing weakgc 0x{:x}", self.0.as_ptr() as usize);
-//            reader.trace(self, c);
-//            true
-//        } else {
-//            // we got a read-lock, but the object is None - this should only
-//            // happen if we already broke a cycle somehow.
-//            println!("empty weakgc");
-//            false
-//        };
-//        // these drops matter, so make them explicit: in particular upgraded being
-//        // dropped may cause T::drop() to be called, since we could upgrade a weak and then
-//        // drop the upgraded Arc after the mutator drops its last reference.
-//        drop(r);
-//        drop(upgraded);
-//        flag
-    }
-}
-
-
 impl<'a> Clone for Root<'a> {
     fn clone(&self) -> Self {
         Root(WeakRoot(self.0.0.clone()), PhantomData)
