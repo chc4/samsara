@@ -43,17 +43,28 @@ impl<T: Send + Sync + 'static> Node<T> {
 impl<T: Send + Sync + 'static> Gc<Node<T>> {
     /// Set node to the next link in the list containing self
     fn link_next(&self, mut node: Node<T>, list: &mut List<T>) {
+        println!("1");
         let node = if let Some(curr_next) = self.get(|s| s.next.clone() ) {
+            println!("2");
             assert!(curr_next.as_ptr() != self.as_ptr(), "self-reference");
+            println!("3");
             node.next = Some(curr_next.clone());
+            println!("4");
+            // why does this cause leaks
+            //node.prev = Some(self.clone());
 
             let mut node = Gc::new(node);
+            println!("5");
             curr_next.set(|n| n.prev = Some(node.clone()) );
+            println!("6");
             node
         } else {
+            println!("7");
             Gc::new(node)
         };
+        println!("8");
         self.set(|s| s.next = Some(node.clone()));
+        println!("9");
         list.len += 1;
     }
 
@@ -207,6 +218,30 @@ fn test_list() {
     }
 }
 
+fn mini_list() {
+    println!("creating list");
+    let mut list = List::new();
+    for i in 0..3 {
+        list.push_tail(i);
+    }
+    Collector::yuga();
+    println!("------------ BUG HERE");
+    let n = list.get(1);
+    n.link_next(Node::new(4), &mut list);
+    drop(n);
+    println!("------------ BUG END");
+    /*let mut curr = list.head;
+    loop {
+        if let Some(ref link) = curr {
+            println!("link {}", link.get(|l| l.val));
+            curr = link.get(|l| l.next.clone());
+        } else {
+            break;
+        }
+    }*/
+}
+
+
 #[cfg(not(all(feature = "shuttle", test)))]
 mod test {
     use super::*;
@@ -238,6 +273,16 @@ mod test {
         let mut runner = shuttle::PortfolioRunner::new(true, config);
         runner.add(dfs);
         runner.run(f);
+    }
+
+    #[test]
+    fn shuttle_test_mini() {
+        random(|| {
+            mini_list();
+            Collector::yuga();
+            Collector::nirvana();
+            assert_eq!(crate::gc::number_of_live_objects(), 0);
+        }, 100);
     }
 
     #[test]

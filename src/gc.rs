@@ -96,14 +96,17 @@ impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize, Tracke
     }
 
     fn flags(&self) -> Option<GcFlags> {
+        println!("FLAGS");
         self.upgrade().map(|s| s.1.load(Ordering::Acquire) ).and_then(GcFlags::from_bits)
     }
 
     fn mark_visited(&self) {
+        println!("MARK VISIT {:x}", self.as_ptr() as usize);
         self.upgrade().map(|s| s.1.store(GcFlags::VISITED.bits(), Ordering::Release));
     }
 
     fn clear_visited(&self) {
+        println!("CLEAR VISIT");
         self.upgrade().map(|s| s.1.store(GcFlags::NONE.bits(), Ordering::Release));
     }
 
@@ -116,12 +119,14 @@ impl<T: Trace + 'static> WeakGc for Weak<(RwLock<Option<T>>, AtomicUsize, Tracke
     }
 
     fn invalidate(&self) {
+        println!("INVALIDATE");
         self.upgrade().map(|s| s.0.write().unwrap().take() );
     }
 }
 
 impl<T: Trace> Clone for Gc<T> {
     fn clone(&self) -> Self {
+        println!("GC CLONE 0x{:x}", self.as_ptr() as usize);
         Gc { item: self.item.clone() }
     }
 }
@@ -233,11 +238,13 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 println!("reclaiming soul");
                 let ptr = Arc::as_ptr(&self.item);
                 LOCAL_SENDER.with(|s| {
-                    let rec = try_send(&s.chan.borrow().as_ref().unwrap(), Soul::Reclaimed(ptr as usize));
+                    let rec = s.chan.borrow().as_ref().unwrap().send(Soul::Reclaimed(ptr as usize));
+                    rec.unwrap();
 
                     //rec.map_err(|e| unimplemented!("sending soul error {:?}", e))
                 });
             } else {
+                if Arc::strong_count(&self.item) != 1 { panic!() }
                 // We know it didn't have a weak count, so wasn't added to
                 // the defer list. We just clean up the object entirely.
                 // Fall through to the normal Arc drop.

@@ -39,7 +39,7 @@ impl<'a> Clone for Root<'a> {
 #[derive(Default)]
 pub struct Collector<'a> {
     deferred: OrdMap<usize, Root<'a>>,
-    pub visited: HashMap<usize, (usize, usize, usize)>, // ptr -> (starting strong count, incoming edges, id)
+    pub visited: HashMap<usize, (usize, usize)>, // ptr -> (starting strong count, incoming edges, id)
     neighbors: Vec<RoaringBitmap>, // adjacency list for visited ids. tracks *incoming* edges.
 }
 
@@ -125,8 +125,8 @@ impl<'a> Collector<'a> {
                     im::ordmap::DiffItem::Update { old, new } => new.1,
                     im::ordmap::DiffItem::Remove(o, i) => { println!("REMOVED"); i },
                 };
+                println!("-- collection visiting 0x{:x}", item.0.as_ptr());
                 self.add_node(&*item.0);
-                println!("collection visiting 0x{:x}", item.0.as_ptr());
                 let visitable = item.0.visit(self);
                 if !visitable {
                     println!("figure out how to shortcut");
@@ -149,16 +149,17 @@ impl<'a> Collector<'a> {
         // for cycles are nodes where their initial count == incoming AND they aren't
         // marked DIRTY.
         let mut nodes = self.visited.iter().collect::<Vec<_>>();
-        nodes.sort_by_key(|n| n.1.2);
+        nodes.sort_by_key(|n| n.1.1);
         let pre_nodes = nodes.clone();
 
         let mut components = UnionFind::<Option<usize>>::new();
         let mut graph_nodes = vec![];
         let mut graph_edges = vec![]; // (from, to)
-        for (node, (count, incoming, idx)) in nodes.drain(..) {
+        for (node, (count, idx)) in nodes.drain(..) {
             let gc = self.deferred.get(node).expect(format!("{:x}", node).as_str());
             let edges = &self.neighbors[*idx];
             let Some(flags) = gc.0.flags() else { graph_nodes.push(GraphNode::Dead); continue };
+            let incoming = edges.len();
             println!("{:x}:{}:{} ({:?}) - {:?}", node, count, incoming,
                 flags, edges);
             // we have to reset the bitflags for all of our objects, in case they
@@ -168,7 +169,7 @@ impl<'a> Collector<'a> {
                 components.union(Some(*idx), None);
                 graph_nodes.push(GraphNode::Dirty);
             }
-            else if count == incoming {
+            else if *count as u64 == incoming {
                 graph_nodes.push(GraphNode::Internal);
                 for edge in edges {
                     graph_edges.push((edge as usize, *idx));
@@ -224,7 +225,7 @@ impl<'a> Collector<'a> {
     }
 
     #[cfg(feature = "graphviz")]
-    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, usize, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, usize)>) {
+    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, usize)>) {
         use graphviz_rust::*;
         use graphviz_rust::printer::*;
         use graphviz_rust::cmd::*;
@@ -232,8 +233,9 @@ impl<'a> Collector<'a> {
         use dot_generator::*;
         let g = graph!(strict di id!("t");
           subgraph!("x",
-            pre_nodes.iter().flat_map(|(node, (count, incoming, idx))| {
-                let mut edges = self.neighbors[*idx].iter().map(|e| {
+            pre_nodes.iter().flat_map(|(node, (count, idx))| {
+                let edges = &self.neighbors[*idx];
+                let mut edges = edges.iter().map(|e| {
                     Stmt::Edge(edge!(node_id!(e) => node_id!(idx)))
                 }).collect::<Vec<Stmt>>();
                 let color = match &after_nodes[*idx] {
@@ -247,7 +249,7 @@ impl<'a> Collector<'a> {
                 let label = format!("\"{} {}:{}\"",
                     idx,
                     //self.deferred.get(node).unwrap().0.as_ptr(),
-                    count, incoming);
+                    count, edges.len());
                 edges.push(Stmt::Node(node!(idx; attr!("color", color), attr!("label", label))));
                 edges
             }).collect()
@@ -262,7 +264,7 @@ impl<'a> Collector<'a> {
     }
 
     #[cfg(not(feature = "graphviz"))]
-    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, usize, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, usize)>) {
+    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, usize)>) {
         // noop
     }
 
@@ -283,8 +285,8 @@ impl<'a> Collector<'a> {
             self.neighbors.push(RoaringBitmap::new());
             novel = true;
             let strong_count = root.strong_count();
-            println!("object {} has strong_count {}", root.as_ptr(), strong_count);
-            (strong_count, 0, idx)
+            println!("object {:x} has strong_count {}", root.as_ptr(), strong_count);
+            (strong_count, idx)
         });
         // it's probably useful to be able to tell if we are first seeing a node
         // or not...? i can't think of for what right now, though
@@ -293,15 +295,9 @@ impl<'a> Collector<'a> {
 
     pub fn add_edge(&mut self, root: &dyn WeakGc, item: &dyn WeakGc) {
         println!("got edge {:x}->{:x}", root.as_ptr(), item.as_ptr());
-        let root_idx = self.visited.entry(root.as_ptr()).and_modify(|e| {
-            // TODO: do we need incoming edge count now that we have adjacency lists?
-            // TODO: think if this is the test_list problem - object with two edges
-            // to an object should have strong_count = 2 but we should also find
-            // two edges when visiting so should be fine?
-            e.1 += 1
-        }).or_insert_with(|| panic!() ).2;
+        let root_idx = self.visited.entry(root.as_ptr()).or_insert_with(|| panic!() ).1;
         // add the reverse edge to our graph
-        self.neighbors[root_idx].insert(self.visited.get(&item.as_ptr()).unwrap().2 as u32);
+        self.neighbors[self.visited[&item.as_ptr()].1].insert(root_idx as u32);
     }
 
     fn process(&mut self, receiver: Receiver<Soul>) {
@@ -327,6 +323,9 @@ impl<'a> Collector<'a> {
                 },
                 Soul::Yuga(b) => {
                     println!("triggering yuga");
+                    for root in &self.deferred {
+                        println!("DEFERRED ROOT 0x{:x} HAS STRONG_COUNT {}", root.0, root.1.0.strong_count());
+                    }
                     self.collect();
                     // signal to all listeners that the yuga ended
                     *b.0.lock().unwrap() = true;
