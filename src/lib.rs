@@ -169,8 +169,14 @@ mod tests {
     }
 
     #[test]
-    fn two_cycles() {
+    fn two_cycles_join() {
         struct Join { a: Gc<Bar>, b: Gc<Bar> };
+        impl Trace for Join {
+            fn trace(&self, root: &WeakRoot, c: &mut Collector) {
+                self.a.trace(root, c);
+                self.b.trace(root, c);
+            }
+        }
         let join = {
             let a1 = Gc::new(Bar { b: 0, bar: vec![] });
             let a2 = Gc::new(Bar { b: 1, bar: vec![] });
@@ -186,13 +192,43 @@ mod tests {
             b2.set(|b| b.bar = vec![b3.clone()]);
             b3.set(|b| b.bar = vec![b1.clone()]);
 
-            Join { a: a1.clone(), b: b1.clone() }
+            Gc::new(Join { a: a1.clone(), b: b1.clone() })
         };
 
         println!("1");
         Collector::yuga();
+        assert_eq!(gc::number_of_live_objects(), 7);
         println!("2");
         drop(join);
+        Collector::yuga();
+        assert_eq!(gc::number_of_live_objects(), 0);
+    }
+
+    #[test]
+    fn two_cycles_meet() {
+        let root = {
+            let meet = Gc::new(Bar { b: 123, bar: vec![] });
+            let a1 = Gc::new(Bar { b: 0, bar: vec![] });
+            let a2 = Gc::new(Bar { b: 1, bar: vec![] });
+            let a3 = Gc::new(Bar { b: 2, bar: vec![] });
+            a1.set(|a| a.bar = vec![a2.clone()]);
+            a2.set(|a| a.bar = vec![a3.clone()]);
+            a3.set(|a| a.bar = vec![a1.clone(), meet.clone()]);
+
+            let b1 = Gc::new(Bar { b: 3, bar: vec![] });
+            let b2 = Gc::new(Bar { b: 4, bar: vec![] });
+            let b3 = Gc::new(Bar { b: 5, bar: vec![] });
+            b1.set(|b| b.bar = vec![b2.clone()]);
+            b2.set(|b| b.bar = vec![b3.clone()]);
+            b3.set(|b| b.bar = vec![b1.clone(), meet.clone()]);
+            b2
+        };
+
+        println!("1");
+        Collector::yuga();
+        assert_eq!(gc::number_of_live_objects(), 4);
+        println!("2");
+        drop(root);
         Collector::yuga();
         assert_eq!(gc::number_of_live_objects(), 0);
     }

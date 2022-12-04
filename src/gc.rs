@@ -157,7 +157,7 @@ impl<T: Trace> Trace for Gc<T> where (RwLock<Option<T>>, AtomicUsize, Tracker): 
         if (self.item.1.load(Ordering::Acquire) & GcFlags::VISITED.bits()) == 0 {
             // TODO: this could probably be more efficient - there's no reason
             // to make a weak ref if the item is already in the node map...
-            c.add_node(WeakRoot(Arc::downgrade(&self.item) as Weak<_> as Weak<dyn GcObject>));
+            c.add_node(&WeakRoot(Arc::downgrade(&self.item) as Weak<_> as Weak<dyn GcObject>));
         }
         c.add_edge(root, WeakRoot(Arc::downgrade(&self.item) as Weak<_> as Weak<dyn GcObject>));
     }
