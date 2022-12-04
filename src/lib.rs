@@ -221,11 +221,11 @@ mod tests {
             b1.set(|b| b.bar = vec![b2.clone()]);
             b2.set(|b| b.bar = vec![b3.clone()]);
             b3.set(|b| b.bar = vec![b1.clone(), meet.clone()]);
-            b2
+            a3
         };
 
         println!("1");
-        Collector::yuga();
+        root.get(|r| r.bar[0].get(|b| Collector::yuga()));
         assert_eq!(gc::number_of_live_objects(), 4);
         println!("2");
         drop(root);

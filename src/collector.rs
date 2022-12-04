@@ -104,6 +104,7 @@ impl<'a> Ord for Root<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum GraphNode {
     Unknown,
     Dead,
@@ -136,8 +137,12 @@ impl<'a> Collector<'a> {
         // because we need to maintain the "parents are visited before children"
         // invariant, which it would break - we could have two root ones, with
         // the second one a child of the first.
+        let mut components = UnionFind::<Component>::new();
         let mut to_visit: VecDeque<(usize, Root)> = roots.clone().into_iter().collect();
+        let mut alive = VecDeque::new();
         while let Some((ptr, item)) = to_visit.pop_back() {
+            // XXX: this is actually a DFS now. we should instead do BFS for better
+            // cache behavior.
             // skip the item if we already visited it or it's been deallocated
             if item.0.flags().map(|flag| flag.contains(GcFlags::VISITED)) != Some(false) {
                 println!("skipping root {:x}", ptr);
@@ -152,6 +157,11 @@ impl<'a> Collector<'a> {
             if !visitable {
                 println!("figure out how to shortcut");
                 //item.0.clear_visited();
+                //self.stack.push_front(ptr);
+                let idx = self.visited[&item.0.as_ptr()].1;
+                alive.push_back(idx);
+                components.union(Component::Unset(idx), Component::Live);
+                continue;
                 // can we just clear_visited? does this break if you have one root's
                 // traversal be unable to visit the node because it is locked, and
                 // then another's traveral later be able to visit it, does it
@@ -165,10 +175,11 @@ impl<'a> Collector<'a> {
                 im::ordmap::DiffItem::Remove(_o, _i) => panic!(),
             }).collect();
             if items.len() == 0 {
-                self.stack.push_back(ptr);
+                self.stack.push_front(ptr);
             }
             to_visit.extend(items);
         }
+        println!("stack {:?}", self.stack.iter().map(|n| self.visited[n].1).collect::<Vec<_>>());
 
         // We've visited all the nodes in our graph! The only possible candidates
         // for cycles are nodes where their initial count == incoming AND they aren't
@@ -177,16 +188,15 @@ impl<'a> Collector<'a> {
         nodes.sort_by_key(|n| n.1.1);
         let pre_nodes = nodes.clone();
 
-        let mut components = UnionFind::<Component>::new();
-        let mut graph_nodes = vec![];
+        let mut graph_nodes = Vec::from_iter((0..nodes.len()).map(|_| GraphNode::Unknown));
         let mut graph_edges = vec![]; // (from, to)
         //for (node, (count, idx)) in nodes.drain(..) {
         while let Some(node) = self.stack.pop_back() {
-            let (ref count, ref idx) = self.visited[&node];
+            let (ref count, idx) = self.visited[&node];
             let gc = self.deferred.get(&node).expect(format!("{:x}", node).as_str());
             let Some(flags) = gc.0.flags() else { graph_nodes.push(GraphNode::Dead); continue };
-            if !flags.contains(GcFlags::VISITED) { continue; }
-            let edges = &self.neighbors[*idx];
+            //if !flags.contains(GcFlags::VISITED) { continue; }
+            let edges = &self.neighbors[idx];
             let incoming = edges.1.len();
             println!("#{} {:x}:{}:{} ({:?}) - {:?}", idx, node, count, incoming,
                 flags, edges.1);
@@ -195,23 +205,23 @@ impl<'a> Collector<'a> {
             gc.0.clear_visited();
             if flags.contains(GcFlags::DIRTY) {
                 // mutator lost and possibly gained a reference, have to assume it's alive
-                components.union(Component::Unset(*idx), Component::Live);
-                graph_nodes.push(GraphNode::Dirty);
+                components.union(Component::Unset(idx), Component::Live);
+                graph_nodes[idx] = GraphNode::Dirty;
             }
             else if *count as u64 == incoming {
                 // count is correct! assign to a component and visit in-neighbors
-                graph_nodes.push(GraphNode::Internal);
+                graph_nodes[idx] = GraphNode::Internal;
             } else {
                 // we could start tearing down the graph here i guess
-                graph_nodes.push(GraphNode::Live);
-                components.union(Component::Unset(*idx), Component::Live);
+                graph_nodes[idx] = GraphNode::Live;
+                components.union(Component::Unset(idx), Component::Live);
             }
             for edge in &edges.1 {
-                graph_edges.push((edge as usize, *idx));
+                graph_edges.push((edge as usize, idx));
             }
-            let comp = components.find(Component::Unset(*idx));
-            if comp == Component::Unset(*idx) {
-                components.union(comp, Component::Root(*idx));
+            let comp = components.find(Component::Unset(idx));
+            if comp == Component::Unset(idx) {
+                components.union(comp, Component::Root(idx));
             }
             for edge in &edges.1 {
                 let identity = Component::Unset(edge as usize);
@@ -223,6 +233,26 @@ impl<'a> Collector<'a> {
                 }
             }
         }
+
+        // we have to iterate over all the live objects, since a traversal down
+        // from a root may hit live objects, leaving the entire sub-graph dirty
+        // if we didn't otherwise traverse upwards from anything else downstream.
+        for live_obj in alive {
+            let mut visit = VecDeque::from([live_obj]);
+            while let Some(item) = visit.pop_back() {
+                let (ptr, adj) = &self.neighbors[item];
+                let node = &self.deferred[&ptr].0;
+                let Some(flags) = node.flags() else { continue; };
+                // this object was already clear, which must have been from the
+                // SCC computation.
+                if !flags.contains(GcFlags::VISITED) { continue; }
+                node.clear_visited();
+                for neighbor in adj {
+                    visit.push_front(neighbor as usize);
+                }
+            }
+        }
+
         assert_eq!(pre_nodes.len(), graph_nodes.len());
         for component in components.subsets() {
             println!("component {:?} {}", component, component.contains(&Component::Live));
@@ -238,6 +268,12 @@ impl<'a> Collector<'a> {
             }
         }
         self.draw_graph(pre_nodes, graph_nodes, graph_edges, &mut components);
+        #[cfg(test)]
+        for node in self.deferred.iter() {
+            // in test mode, verify that we cleared all object flags
+            assert!(node.1.0.flags().map(|f| f != GcFlags::NONE) != Some(true),
+                "still marked node #{} {:?}", self.visited[node.0].1, node.0);
+        }
 
         // We can now reset our working sets of objects; possibly-cyclic data
         // from the worker threads will all be added later since it's buffered
@@ -266,7 +302,7 @@ impl<'a> Collector<'a> {
                     Stmt::Edge(edge!(node_id!(e) => node_id!(idx)))
                 }).collect::<Vec<Stmt>>();
                 let color = match &after_nodes[*idx] {
-                    GraphNode::Unknown => "white",
+                    GraphNode::Unknown => "orange",
                     GraphNode::Dead => "grey",
                     GraphNode::Dirty => "black",
                     GraphNode::Live => "green",
