@@ -134,15 +134,23 @@ impl<'a> Collector<'a> {
 
         let mut components = UnionFind::<Component>::new();
         let mut to_visit: VecDeque<(usize, Root)> = VecDeque::new();
-        let mut alive = HashSet::new();
+        let mut alive = HashSet::<usize>::new();
         for root in roots.clone() {
             // start a new BFS traversal for each root
-            if alive.contains(&root.0) {
+            if alive.contains(&root.0.clone()) {
                 println!("skipping already known unvisitable node {:x}", root.0);
                 continue;
             }
-            if root.1.0.flags().map(|flag| flag.contains(GcFlags::VISITED)) != Some(false) {
-                println!("skipping root {:x}", root.1.0.as_ptr());
+            let visited = root.1.0.flags().map(|flag| flag.contains(GcFlags::VISITED));
+            if visited == None {
+                // we couldn't update the weak reference, mark it so we drop
+                // the weak reference in the eager alive dropping phase
+                println!("skipping dead root {:x}", root.1.0.as_ptr());
+                alive.insert(root.0);
+                continue;
+            } else if visited != Some(false) {
+                println!("skipping visited root {:x}", root.1.0.as_ptr());
+                continue;
             }
             to_visit.push_front(root);
             while let Some((ptr, item)) = to_visit.pop_front() {
@@ -183,14 +191,14 @@ impl<'a> Collector<'a> {
             self.neighbors.iter().enumerate().flat_map(|(id, edges)|
                 edges.1.iter().map(move |dst| (id, dst)) ));
         // map the alive ptrs to alive node ids
-        let mut alive_ids: HashSet<NodeId> = alive.iter().map(|ptr| {
+        let mut alive_ids: HashSet<NodeId> = alive.iter().filter_map(|ptr| {
             // and eagerly drop the weak references to all known live objects, so that
             // they can be freed if we were the only ones keeping them alive.
             self.deferred.remove(&ptr);
-            let id = self.visited[ptr].1;
+            let Some(id) = self.visited.get(ptr).map(|e| e.1) else { return None };
             graph_nodes[id.0 as usize] = GraphNode::Live;
             self.visited.remove(&ptr);
-            id
+            Some(id)
         }).collect();
         drop(alive);
         // make a visitation set of node ids
