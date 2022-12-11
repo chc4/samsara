@@ -10,7 +10,6 @@ use std::collections::VecDeque;
 
 use im::{HashSet, HashMap, OrdSet, OrdMap};
 use roaring::RoaringBitmap;
-use reunion::{UnionFind, UnionFindTrait};
 
 #[cfg(all(feature = "shuttle", test))]
 use shuttle::thread_local;
@@ -132,7 +131,6 @@ impl<'a> Collector<'a> {
         // the roots as edges when visiting the graph.
         mem::swap(&mut roots, &mut self.deferred);
 
-        let mut components = UnionFind::<Component>::new();
         let mut to_visit: VecDeque<(usize, Root)> = VecDeque::new();
         let mut alive = HashSet::<usize>::new();
         for root in roots.clone() {
@@ -169,7 +167,6 @@ impl<'a> Collector<'a> {
                     println!("figure out how to shortcut");
                     // XXX: is this good?
                     item.0.clear_visited();
-                    //components.union(Component::Unset(self.visited[&ptr].1.0 as usize), Component::Live);
                     alive.insert(ptr);
                     continue;
                 }
@@ -253,7 +250,7 @@ impl<'a> Collector<'a> {
         }
 
         #[cfg(feature = "graphviz")]
-        self.draw_graph(pre_nodes, graph_nodes, graph_edges, &mut components);
+        self.draw_graph(pre_nodes, graph_nodes, graph_edges);
 
         // now destroy all unreachable dead nodes
         for (ptr, row) in &self.visited {
@@ -283,7 +280,7 @@ impl<'a> Collector<'a> {
     }
 
     #[cfg(feature = "graphviz")]
-    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, NodeId, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, u32)>, components: &mut UnionFind<Component>) {
+    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, NodeId, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, u32)>) {
         use graphviz_rust::*;
         use graphviz_rust::printer::*;
         use graphviz_rust::cmd::*;
@@ -319,7 +316,7 @@ impl<'a> Collector<'a> {
     }
 
     #[cfg(not(feature = "graphviz"))]
-    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, NodeId, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, usize)>, components: &mut UnionFind<Component>) {
+    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, NodeId, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, usize)>) {
         // noop
     }
 
