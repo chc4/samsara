@@ -61,8 +61,8 @@ impl WeakRoot {
         upgraded.read_and_trace(self, c)
     }
 
-    pub fn as_ptr(&self) -> usize {
-        self.0.as_ptr() as *const () as usize
+    pub fn as_ptr(&self) -> *const () {
+        self.0.as_ptr() as *const ()
     }
 
     pub fn flags(&self) -> Option<GcFlags> {

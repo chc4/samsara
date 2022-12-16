@@ -41,11 +41,11 @@ impl<'a> Clone for Root<'a> {
 #[derive(Default)]
 pub struct Collector<'a> {
     /// deferred: ptr -> Root
-    deferred: OrdMap<usize, Root<'a>>,
+    deferred: OrdMap<*const (), Root<'a>>,
     /// visited: ptr -> (starting strong count, id, incoming edge count)
-    pub visited: HashMap<usize, (usize, NodeId, usize)>,
+    pub visited: HashMap<*const (), (NodeId, usize)>,
     /// neighbors: // adjacency list for visited ids. tracks *outgoing* edges.
-    neighbors: Vec<(usize, RoaringBitmap)>,
+    neighbors: Vec<(*const (), RoaringBitmap)>,
 }
 
 // Note [Defer List]
@@ -131,35 +131,35 @@ impl<'a> Collector<'a> {
         // the roots as edges when visiting the graph.
         mem::swap(&mut roots, &mut self.deferred);
 
-        let mut to_visit: VecDeque<(usize, Root)> = VecDeque::new();
-        let mut alive = HashSet::<usize>::new();
+        let mut to_visit: VecDeque<(*const (), Root)> = VecDeque::new();
+        let mut alive = HashSet::<*const ()>::new();
         for root in roots.clone() {
             // start a new BFS traversal for each root
             if alive.contains(&root.0.clone()) {
-                println!("skipping already known unvisitable node {:x}", root.0);
+                println!("skipping already known unvisitable node {:?}", root.0);
                 continue;
             }
             let visited = root.1.0.flags().map(|flag| flag.contains(GcFlags::VISITED));
             if visited == None {
                 // we couldn't update the weak reference, mark it so we drop
                 // the weak reference in the eager alive dropping phase
-                println!("skipping dead root {:x}", root.1.0.as_ptr());
+                println!("skipping dead root {:?}", root.1.0.as_ptr());
                 alive.insert(root.0);
                 continue;
             } else if visited != Some(false) {
-                println!("skipping visited root {:x}", root.1.0.as_ptr());
+                println!("skipping visited root {:?}", root.1.0.as_ptr());
                 continue;
             }
             to_visit.push_front(root);
             while let Some((ptr, item)) = to_visit.pop_front() {
                 // skip the item if we already visited it or it's been deallocated
                 if item.0.flags().map(|flag| flag.contains(GcFlags::VISITED)) != Some(false) {
-                    println!("skipping frontier item {:x}", ptr);
+                    println!("skipping frontier item {:?}", ptr);
                     continue;
                 }
                 // snapshot of all the known nodes
                 let snap = self.deferred.clone();
-                println!("visiting {:x}", item.0.as_ptr());
+                println!("visiting {:?}", item.0.as_ptr());
                 self.add_node(&item.0);
                 item.0.mark_visited();
                 let visitable = item.0.visit(self);
@@ -172,7 +172,7 @@ impl<'a> Collector<'a> {
                 }
                 // get the newly found nodes from the frontier, and push them
                 // to the to_visit stack
-                let items: Vec<(usize, Root)> = snap.diff(&self.deferred).map(|item| match item {
+                let items: Vec<(*const (), Root)> = snap.diff(&self.deferred).map(|item| match item {
                     im::ordmap::DiffItem::Add(k, item) => (*k, item.clone()),
                     im::ordmap::DiffItem::Update { old, new } => (*new.0, new.1.clone()),
                     im::ordmap::DiffItem::Remove(_o, _i) => panic!(),
@@ -192,7 +192,7 @@ impl<'a> Collector<'a> {
             // and eagerly drop the weak references to all known live objects, so that
             // they can be freed if we were the only ones keeping them alive.
             self.deferred.remove(&ptr);
-            let Some(id) = self.visited.get(ptr).map(|e| e.1) else { return None };
+            let Some(id) = self.visited.get(ptr).map(|e| e.0) else { return None };
             graph_nodes[id.0 as usize] = GraphNode::Live;
             self.visited.remove(&ptr);
             Some(id)
@@ -208,30 +208,34 @@ impl<'a> Collector<'a> {
         // are transitively reachable from the mutator as well.
         'visit: for (ptr, row) in &self.visited {
             // if the node is already marked alive, we're done with it
-            if alive_ids.contains(&row.1) {
+            if alive_ids.contains(&row.0) {
                 continue;
             }
             let Some(node) = self.deferred.get(&ptr) else { panic!() };
             let Some(flags) = node.0.flags() else { panic!("what do we do here?") };
             if !flags.contains(GcFlags::VISITED) { panic!("can this happen?") }
             'check_live: {
+                // we have to be careful about the order here - we check the flags
+                // after we get the count because a mutator might be losing a
+                // reference at the same time we are trying to check it
+                let count = Weak::strong_count(&node.0.0);
                 if flags.contains(GcFlags::DIRTY) {
                     // alive because mutator set flag
-                    graph_nodes[row.1.0 as usize] = GraphNode::Dirty;
+                    graph_nodes[row.0.0 as usize] = GraphNode::Dirty;
                     break 'check_live;
                 }
-                if row.0 == row.2 {
-                    graph_nodes[row.1.0 as usize] = GraphNode::Dead;
+                if count == row.1 {
+                    graph_nodes[row.0.0 as usize] = GraphNode::Dead;
                     continue 'visit;
                 } else {
                     // alive because we have external edge from mutator
-                    graph_nodes[row.1.0 as usize] = GraphNode::Live;
+                    graph_nodes[row.0.0 as usize] = GraphNode::Live;
                     break 'check_live;
                 }
             };
-            println!("found new alive root node {:x}", ptr);
-            alive_ids.insert(row.1);
-            to_visit_ids.push_front(row.1);
+            println!("found new alive root node {:?}", ptr);
+            alive_ids.insert(row.0);
+            to_visit_ids.push_front(row.0);
             while let Some(outgoing) = to_visit_ids.pop_back() {
                 // sanity check that we're always pushing forward only the alive node frontier
                 #[cfg(test)]
@@ -257,8 +261,8 @@ impl<'a> Collector<'a> {
             let node = self.deferred.get(&ptr).unwrap();
             node.0.clear_visited();
 
-            if !alive_ids.contains(&row.1) {
-                println!("got dead node {:x}", ptr);
+            if !alive_ids.contains(&row.0) {
+                println!("got dead node {:?}", ptr);
                 node.0.invalidate();
             }
         }
@@ -267,7 +271,7 @@ impl<'a> Collector<'a> {
         for node in self.deferred.iter() {
             // in test mode, verify that we cleared all object flags
             assert!(node.1.0.flags().map(|f| f != GcFlags::NONE) != Some(true),
-                "still marked node #{} {:?}", self.visited[node.0].1.0, node.0);
+                "still marked node #{} {:?}", self.visited[node.0].0.0, node.0);
         }
         println!("done");
 
@@ -280,14 +284,14 @@ impl<'a> Collector<'a> {
     }
 
     #[cfg(feature = "graphviz")]
-    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, NodeId, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, u32)>) {
+    fn draw_graph(&self, pre_nodes: Vec<(&*const (), &(NodeId, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, u32)>) {
         use graphviz_rust::*;
         use graphviz_rust::printer::*;
         use graphviz_rust::cmd::*;
         use dot_structures::*;
         use dot_generator::*;
         let g = graph!(strict di id!("t"); subgraph!("s",
-            pre_nodes.iter().flat_map(|(ptr, (start_count, idx, incoming))| {
+            pre_nodes.iter().flat_map(|(ptr, (idx, incoming))| {
                 let (_, edges) = &self.neighbors[idx.0 as usize];
                 let mut edges = edges.iter().map(|e| {
                     Stmt::Edge(edge!(node_id!(e) => node_id!(idx.0)))
@@ -297,11 +301,11 @@ impl<'a> Collector<'a> {
                     GraphNode::Dead => "grey",
                     GraphNode::Dirty => "black",
                     GraphNode::Live => "green",
-                    GraphNode::Reachable => "light-green",
+                    GraphNode::Reachable => "lime",
                 };
-                let label = format!("\"{} {}:{}\"",
+                let label = format!("\"{} {:?}:{}\"",
                     idx.0,
-                    start_count, incoming);
+                    Weak::strong_count(&self.deferred[ptr].0.0), incoming);
                 edges.push(Stmt::Node(node!(idx.0; attr!("color", color), attr!("label", label))));
                 edges
             }).collect()
@@ -316,19 +320,19 @@ impl<'a> Collector<'a> {
     }
 
     #[cfg(not(feature = "graphviz"))]
-    fn draw_graph(&self, pre_nodes: Vec<(&usize, &(usize, NodeId, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, usize)>) {
+    fn draw_graph(&self, pre_nodes: Vec<(&*const (), &(NodeId, usize))>, after_nodes: Vec<GraphNode>, after_edges: Vec<(usize, usize)>) {
         // noop
     }
 
     pub fn add_node(&mut self, root: &WeakRoot) -> bool {
-        if root.as_ptr() == 0 { panic!() }
+        if root.as_ptr() as usize == 0 { panic!() }
         let mut novel = false;
         self.visited.entry(root.as_ptr()).or_insert_with(|| {
             // We didn't already visit the gc object, so we are initially adding
             // it to the graph; we set the VISIT flag for [Graph Tearing] and then
             // initialize the vertex with the correct weight, and also add it to
             // our list of all root nodes so that we visit it later.
-            println!("got new node {:x}", root.as_ptr());
+            println!("got new node {:?}", root.as_ptr());
             //root.mark_visited();
             self.deferred.entry(root.as_ptr()).or_insert_with(|| {
                 Root(root.clone(), PhantomData)
@@ -337,7 +341,7 @@ impl<'a> Collector<'a> {
             self.neighbors.push((root.as_ptr(), RoaringBitmap::new()));
             novel = true;
             let strong_count = root.0.strong_count();
-            (strong_count, NodeId(idx as u32), 0)
+            (NodeId(idx as u32), 0)
         });
         // it's probably useful to be able to tell if we are first seeing a node
         // or not...? i can't think of for what right now, though
@@ -346,13 +350,13 @@ impl<'a> Collector<'a> {
 
     pub fn add_edge(&mut self, root: &WeakRoot, item: WeakRoot) {
         // XXX: this has absolutely terrible cache locality
-        println!("got edge {:x}->{:x}", root.as_ptr(), item.as_ptr());
-        let root_idx = self.visited.entry(root.as_ptr()).or_insert_with(|| panic!() ).1;
+        println!("got edge {:?}->{:?}", root.as_ptr(), item.as_ptr());
+        let root_idx = self.visited.entry(root.as_ptr()).or_insert_with(|| panic!() ).0;
         let item_row = self.visited.entry(item.as_ptr()).or_insert_with(|| panic!() );
         // increment the item's incoming count
-        item_row.2 += 1;
+        item_row.1 += 1;
         // add outgoing edge to our graph
-        self.neighbors[root_idx.0 as usize].1.insert(item_row.1.0);
+        self.neighbors[root_idx.0 as usize].1.insert(item_row.0.0);
     }
 
     fn process(&mut self, receiver: Receiver<Soul>) {
@@ -360,7 +364,7 @@ impl<'a> Collector<'a> {
             println!("collector received soul");
             match soul {
                 Soul::Died(d) => {
-                    match d.as_ptr() {
+                    match d.as_ptr() as usize {
                         // We could've been given a Weak<T> that has since been dropped
                         0 => (),
                         ptr => {
@@ -374,7 +378,7 @@ impl<'a> Collector<'a> {
                 },
                 Soul::Reclaimed(d) => {
                     println!("told about a definitely not cyclic object 0x{:x}", d);
-                    self.deferred.remove(&d);
+                    self.deferred.remove(&(d as *const ()));
                 },
                 Soul::Yuga(b) => {
                     println!("triggering yuga");
