@@ -69,6 +69,7 @@ pub struct Collector<'a> {
 // sooner.
 
 // Note [Cycle Collection]
+// TODO: this is wrong, fix it
 // When doing a collection, we visit every item reachable from the roots,
 // initializing them in a scratch space with an initial value of `strong_count`
 // and decrementing the value every time we see a strong reference to the item,

@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn two_cycles_join() {
-        struct Join { a: Gc<Bar>, b: Gc<Bar> };
+        struct Join { a: Gc<Bar>, b: Gc<Bar> }
         impl Trace for Join {
             fn trace(&self, root: &WeakRoot, c: &mut Collector) {
                 self.a.trace(root, c);

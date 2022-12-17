@@ -92,6 +92,12 @@ impl WeakRoot {
 
 impl<T: Trace> GcObject for (RwLock<Option<T>>, AtomicUsize, Tracker) {
     fn read_and_trace(&self, _self: &WeakRoot, c: &mut Collector) -> bool {
+        // When tracing, we have to acquire a *write* lock if the object has
+        // interior mutability - See [Moving Reference] for more.
+        if <T as Trace>::MUT == true {
+            // TODO: ugh this is annoying to format. ill write it later.
+            panic!("{} MUT", std::any::type_name::<T>());
+        }
         let Ok(r) = self.0.try_read() else {
             println!("can't acquire read-lock on weakgc");
             // We couldn't acquire a read-lock, so we know *something* else has
@@ -164,6 +170,7 @@ impl<T: Trace> Trace for Gc<T> where (RwLock<Option<T>>, AtomicUsize, Tracker): 
 }
 
 // Note [Graph Tearing]
+// TODO: this is outdated, fix it
 // Unfortunately, when doing [Cycle Collection], we hit a problem in the face of concurrent mutators.
 // Consider the simple graph of items A<->B that form a cyclic reference and are
 // both on our defer list, and assume there is a mutator with a live reference
@@ -203,6 +210,32 @@ impl<T: Trace> Trace for Gc<T> where (RwLock<Option<T>>, AtomicUsize, Tracker): 
 // 1) the mutator is currently holding a live reference it added, in which case
 // `strong_count` is more than incoming-count 2) it added and then removed a
 // reference, in which case `strong_count` is correct but DIRTY was set.
+
+// Note [Moving Reference]
+// On some mutator operations read/write operations we have to transition from
+// VISITED->DIRTY as well, not just on Drop. We could have an object graph like
+// A<->B<->C with a live mutator reference to B. If the collector visits A, and
+// then the mutator does B.get(|b| b.A.set(|a| b.C.set(|c| c.B = Some(a.B.take()) )))
+// to move a reference from A to C, and then the collector visits C, it would
+// incorrectly double-count the reference to B and think the subgraph of objects
+// is unreachable. The problem is one of *moving* a reference across the collector's
+// visitation frontier; if the collector only *clones* the reference then we handle
+// it via [Graph Tearing].
+// We always have to transition on Gc.set(f) calls. We *also* have to transition
+// on Gc.get(f) calls, however, if the Gc object has interior mutability that would
+// allow for moving a Gc<T> object through a &-reference. Tracing::MUT is an associated
+// constant that must be correctly set by implementers to tell us if an object needs
+// that or not.
+// Finally, we have to care about a Gc references moving *within* an object as well:
+// if we have struct Foo { a: Mutex<Option<Gc<Bar>>, b: Mutex<Option<Gc<Bar>> },
+// we have to make sure Foo.get(|foo| *foo.b.lock() = Some(foo.a.lock().take()) )
+// happening concurrently with visiting Foo is handled correctly. The Gc.get(f)
+// transition doesn't fix this problem since the visit could start after the mutator
+// passes the flag check - instead, if we are visiting a Tracing::MUT object, we
+// try to acquire a *write-lock* instead of only a *read-lock*, guaranteeing us
+// an exclusive reference for the duration (or allowing us to bail out if any
+// existing locks exist).
+
 
 bitflags::bitflags! {
     pub struct GcFlags: usize {
@@ -271,26 +304,10 @@ impl<T: Trace + 'static> Drop for Gc<T> {
             //
             // If we have an AtomicUsize that has the VISITED bit set, we need to
             // set (VISITED & DIRTY) in order to mitigate [Graph Tearing]
-            // TODO: think about atomic orderings
-            // does this even need a load+cmpxchg instead of only cmpxchg??
-            if GcFlags::from_bits(self.item.1.load(Ordering::Acquire)).unwrap().contains(GcFlags::VISITED) {
-                // Try to transition VISITED -> (VISITED & DIRTY).
-                // If the cmpxchg fails, we can just ignore it - either another
-                // thread was concurrently dropping the same object and performed
-                // the transition, or the collector thread finished visiting and
-                // reset the flags to 0.
-                let res = self.item.1.compare_exchange(
-                    GcFlags::VISITED.bits(),
-                    (GcFlags::DIRTY & GcFlags::VISITED).bits(),
-                    Ordering::Release, // TODO: think about atomic orderings
-                    Ordering::Relaxed);
-                if let Err(actual) = res {
-                    println!("gc drop cmpxchg failed compare, was instead {:?}", GcFlags::from_bits(actual));
-                }
-                // we don't return - even thought we marked it dirty so it isn't
-                // collected this cycle, we have to buffer it on the channel
-                // so that it is a candidate for collection *next* cycle.
-            }
+            self.visited_to_dirty();
+            // we don't return - even thought we marked it dirty so it isn't
+            // collected this cycle, we have to buffer it on the channel
+            // so that it is a candidate for collection *next* cycle.
             LOCAL_SENDER.with(|s| {
                 let weak = Arc::downgrade(&self.item);
                 // this may block, blocking mutator thread! this can happen if
@@ -315,6 +332,22 @@ impl<T: Trace> Gc<T> {
             Gc { item: Arc::new((RwLock::new(Some(t)), AtomicUsize::new(0), Tracker::of(&LIVE_COUNT))) })
     }
 
+    fn visited_to_dirty(&self) {
+        // TODO: think about atomic orderings
+        // does this even need a load+cmpxchg instead of only cmpxchg??
+        if GcFlags::from_bits(self.item.1.load(Ordering::Acquire)).unwrap().contains(GcFlags::VISITED) {
+            let res = self.item.1.compare_exchange(
+                GcFlags::VISITED.bits(),
+                (GcFlags::DIRTY & GcFlags::VISITED).bits(),
+                Ordering::Release, // TODO: think about atomic orderings
+                Ordering::Relaxed);
+            if let Err(actual) = res {
+                println!("gc drop cmpxchg failed compare, was instead {:?}", GcFlags::from_bits(actual));
+            }
+        }
+    }
+
+
     /// Used internally to create an empty version of a Gc<T>, in order to break cycles
     /// and initialize cyclic testcases.
     pub(crate) fn empty() -> Self {
@@ -331,11 +364,19 @@ impl<T: Trace> Gc<T> {
     /// in order to break cycles - however, in normal operations, it will not panic.
     pub fn get<F, O>(&self, f: F) -> O where F: Fn(&T) -> O {
         println!("get on 0x{:x}", self.as_ptr() as usize);
+        // See [Moving Reference]
+        if <Self as Trace>::MUT {
+            self.visited_to_dirty();
+        }
         f(self.item.0.read().unwrap().as_ref().unwrap())
     }
 
     pub fn set<F, O>(&self, f: F) -> O where F: Fn(&mut T) -> O {
-        f(self.item.0.write().unwrap().as_mut().unwrap())
+        let mut binding = self.item.0.write().unwrap();
+        let locked = binding.as_mut().unwrap();
+        // See [Moving Reference]
+        self.visited_to_dirty();
+        f(locked)
     }
 
     pub fn as_ptr(&self) -> *const () {
