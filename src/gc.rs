@@ -74,7 +74,7 @@ impl WeakRoot {
     pub fn mark_visited(&self) {
         println!("MARK VISIT {:x}", self.0.as_ptr() as *const () as usize);
         //self.0.upgrade().map(|s| s.0.store(GcFlags::VISITED.bits(), Ordering::Release));
-        self.0.upgrade().map(|s| s.mark_visited());
+        self.0.upgrade().map(|s| { println!("MARK COULD UPGRADE"); s.mark_visited() });
     }
 
     pub fn clear_visited(&self) {
@@ -138,7 +138,7 @@ impl<T: Trace> GcObject for (RwLock<Option<T>>, AtomicUsize, Tracker) {
     }
 
     fn invalidate(&self) {
-        self.0.write().unwrap().take();
+        self.0.try_write().unwrap().take();
     }
 }
 
@@ -203,7 +203,7 @@ impl<T: Trace> Trace for Gc<T> where (RwLock<Option<T>>, AtomicUsize, Tracker): 
 // that we use: we add an AtomicUsize to all Gc<T> objects, which provide a bitfield
 // of flags. When we visit an object, the first thing we do is set a VISITED bit
 // on the object. If a mutator drops an object, if it has a VISITED bit it sets
-// it to (VISITED & DIRTY). When we scan objects to make sure they have value=0
+// it to (VISITED | DIRTY). When we scan objects to make sure they have value=0
 // we then also discount them if `shared_count` isn't the original value, *or*
 // if it has DIRTY set in its bitfield.
 // This fixes the graph tearing problem: when we double check either
@@ -303,7 +303,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
             // to add to its defer list.
             //
             // If we have an AtomicUsize that has the VISITED bit set, we need to
-            // set (VISITED & DIRTY) in order to mitigate [Graph Tearing]
+            // set (VISITED | DIRTY) in order to mitigate [Graph Tearing]
             self.visited_to_dirty();
             // we don't return - even thought we marked it dirty so it isn't
             // collected this cycle, we have to buffer it on the channel
@@ -327,9 +327,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
 
 impl<T: Trace> Gc<T> {
     pub fn new(t: T) -> Self {
-        // We have to initialize the
-        LOCAL_SENDER.with(|_|
-            Gc { item: Arc::new((RwLock::new(Some(t)), AtomicUsize::new(0), Tracker::of(&LIVE_COUNT))) })
+        Gc { item: Arc::new((RwLock::new(Some(t)), AtomicUsize::new(GcFlags::NONE.bits()), Tracker::of(&LIVE_COUNT))) }
     }
 
     fn visited_to_dirty(&self) {
@@ -338,8 +336,8 @@ impl<T: Trace> Gc<T> {
         if GcFlags::from_bits(self.item.1.load(Ordering::Acquire)).unwrap().contains(GcFlags::VISITED) {
             let res = self.item.1.compare_exchange(
                 GcFlags::VISITED.bits(),
-                (GcFlags::DIRTY & GcFlags::VISITED).bits(),
-                Ordering::Release, // TODO: think about atomic orderings
+                (GcFlags::DIRTY | GcFlags::VISITED).bits(),
+                Ordering::Acquire, // TODO: think about atomic orderings
                 Ordering::Relaxed);
             if let Err(actual) = res {
                 println!("gc drop cmpxchg failed compare, was instead {:?}", GcFlags::from_bits(actual));
@@ -351,7 +349,7 @@ impl<T: Trace> Gc<T> {
     /// Used internally to create an empty version of a Gc<T>, in order to break cycles
     /// and initialize cyclic testcases.
     pub(crate) fn empty() -> Self {
-        Gc { item: Arc::new((RwLock::new(None), AtomicUsize::new(0), Tracker::of(&LIVE_COUNT))) }
+        Gc { item: Arc::new((RwLock::new(None), AtomicUsize::new(GcFlags::NONE.bits()), Tracker::of(&LIVE_COUNT))) }
     }
 
     /// Get a read-only view of the contents of the Gc<T> object. This acquires
@@ -366,7 +364,7 @@ impl<T: Trace> Gc<T> {
         println!("get on 0x{:x}", self.as_ptr() as usize);
         // See [Moving Reference]
         if <Self as Trace>::MUT {
-            self.visited_to_dirty();
+            //self.visited_to_dirty();
         }
         f(self.item.0.read().unwrap().as_ref().unwrap())
     }
@@ -375,7 +373,7 @@ impl<T: Trace> Gc<T> {
         let mut binding = self.item.0.write().unwrap();
         let locked = binding.as_mut().unwrap();
         // See [Moving Reference]
-        self.visited_to_dirty();
+        //self.visited_to_dirty();
         f(locked)
     }
 

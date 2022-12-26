@@ -3,7 +3,6 @@ use crate::gc::{Gc, WeakRoot, GcFlags};
 use crate::tracker::{Tracker, TrackerLocation};
 
 use std::cell::{RefCell, Cell};
-use std::rc::Rc;
 use std::mem;
 use core::marker::PhantomData;
 use std::collections::VecDeque;
@@ -15,7 +14,7 @@ use roaring::RoaringBitmap;
 use shuttle::thread_local;
 
 #[cfg(not(all(feature = "shuttle", test)))]
-use std::{sync::{Once, Arc, Weak, Mutex, RwLock, RwLockReadGuard, Condvar, atomic::{AtomicUsize, AtomicBool, Ordering}}, thread};
+use std::{sync::{Arc, Weak, Mutex, RwLock, RwLockReadGuard, Condvar, atomic::{AtomicUsize, AtomicBool, Ordering}}, thread};
 #[cfg(not(all(feature = "shuttle", test)))]
 use rand;
 
@@ -126,6 +125,7 @@ enum Component {
 
 impl<'a> Collector<'a> {
     fn collect(&mut self) {
+        println!("ENTER COLLECT");
         let mut roots = OrdMap::new();
         // save the initial root set of nodes we have to visit
         // also clear the deferred list, so that the OrdMap::diff later finds
@@ -135,26 +135,23 @@ impl<'a> Collector<'a> {
         let mut to_visit: VecDeque<(*const (), Root)> = VecDeque::new();
         let mut alive = HashSet::<*const ()>::new();
         for root in roots.clone() {
-            // start a new BFS traversal for each root
-            if alive.contains(&root.0.clone()) {
-                println!("skipping already known unvisitable node {:?}", root.0);
-                continue;
-            }
-            let visited = root.1.0.flags().map(|flag| flag.contains(GcFlags::VISITED));
-            if visited == None {
-                // we couldn't update the weak reference, mark it so we drop
-                // the weak reference in the eager alive dropping phase
-                println!("skipping dead root {:?}", root.1.0.as_ptr());
-                alive.insert(root.0);
-                continue;
-            } else if visited != Some(false) {
-                println!("skipping visited root {:?}", root.1.0.as_ptr());
-                continue;
-            }
             to_visit.push_front(root);
             while let Some((ptr, item)) = to_visit.pop_front() {
+                println!("visit start for item {:?}", ptr);
                 // skip the item if we already visited it or it's been deallocated
-                if item.0.flags().map(|flag| flag.contains(GcFlags::VISITED)) != Some(false) {
+                if alive.contains(&ptr) {
+                    println!("skipping already known unvisitable node {:?}", ptr);
+                    continue;
+                }
+                let visited = item.0.flags().map(|flag| flag.contains(GcFlags::VISITED));
+                if visited == None {
+                    // we couldn't update the weak reference, mark it so we drop
+                    // the weak reference in the eager alive dropping phase
+                    println!("skipping dead root {:?}", ptr);
+                    alive.insert(ptr);
+                    continue;
+                }
+                if visited == Some(true) {
                     println!("skipping frontier item {:?}", ptr);
                     continue;
                 }
@@ -163,6 +160,8 @@ impl<'a> Collector<'a> {
                 println!("visiting {:?}", item.0.as_ptr());
                 self.add_node(&item.0);
                 item.0.mark_visited();
+                let visited = item.0.flags();
+                assert_ne!(visited, Some(GcFlags::NONE));
                 let visitable = item.0.visit(self);
                 if !visitable {
                     println!("figure out how to shortcut");
@@ -171,6 +170,7 @@ impl<'a> Collector<'a> {
                     alive.insert(ptr);
                     continue;
                 }
+                assert!(self.visited.contains_key(&ptr));
                 // get the newly found nodes from the frontier, and push them
                 // to the to_visit stack
                 let items: Vec<(*const (), Root)> = snap.diff(&self.deferred).map(|item| match item {
@@ -193,7 +193,10 @@ impl<'a> Collector<'a> {
             // and eagerly drop the weak references to all known live objects, so that
             // they can be freed if we were the only ones keeping them alive.
             self.deferred.remove(&ptr);
-            let Some(id) = self.visited.get(ptr).map(|e| e.0) else { return None };
+            let Some(id) = self.visited.get(ptr).map(|e| e.0) else {
+                // the object wasn't in visited list, it was a dead pointer
+                self.visited.remove(&ptr);
+                return None };
             graph_nodes[id.0 as usize] = GraphNode::Live;
             self.visited.remove(&ptr);
             Some(id)
@@ -208,13 +211,14 @@ impl<'a> Collector<'a> {
         // order to mark all objects reachable from it as also live, since they
         // are transitively reachable from the mutator as well.
         'visit: for (ptr, row) in &self.visited {
+            println!("'visit {:?}", ptr);
             // if the node is already marked alive, we're done with it
             if alive_ids.contains(&row.0) {
                 continue;
             }
             let Some(node) = self.deferred.get(&ptr) else { panic!() };
             let Some(flags) = node.0.flags() else { panic!("what do we do here?") };
-            if !flags.contains(GcFlags::VISITED) { panic!("can this happen?") }
+            if !flags.contains(GcFlags::VISITED) { panic!("can this happen? {:?}", flags) }
             'check_live: {
                 // we have to be careful about the order here - we check the flags
                 // after we get the count because a mutator might be losing a
@@ -306,7 +310,7 @@ impl<'a> Collector<'a> {
                 };
                 let label = format!("\"{} {:?}:{}\"",
                     idx.0,
-                    Weak::strong_count(&self.deferred[ptr].0.0), incoming);
+                    self.deferred.get(&ptr).map(|n| Weak::strong_count(&n.0.0)).unwrap_or(0), incoming);
                 edges.push(Stmt::Node(node!(idx.0; attr!("color", color), attr!("label", label))));
                 edges
             }).collect()
@@ -329,10 +333,7 @@ impl<'a> Collector<'a> {
         if root.as_ptr() as usize == 0 { panic!() }
         let mut novel = false;
         self.visited.entry(root.as_ptr()).or_insert_with(|| {
-            // We didn't already visit the gc object, so we are initially adding
-            // it to the graph; we set the VISIT flag for [Graph Tearing] and then
-            // initialize the vertex with the correct weight, and also add it to
-            // our list of all root nodes so that we visit it later.
+            // We didn't already visit the gc object
             println!("got new node {:?}", root.as_ptr());
             //root.mark_visited();
             self.deferred.entry(root.as_ptr()).or_insert_with(|| {
@@ -341,7 +342,6 @@ impl<'a> Collector<'a> {
             let idx = self.neighbors.len();
             self.neighbors.push((root.as_ptr(), RoaringBitmap::new()));
             novel = true;
-            let strong_count = root.0.strong_count();
             (NodeId(idx as u32), 0)
         });
         // it's probably useful to be able to tell if we are first seeing a node
@@ -388,9 +388,6 @@ impl<'a> Collector<'a> {
                     *b.0.lock().unwrap() = true;
                     b.1.notify_all();
                 },
-                Soul::Nirvana(()) => {
-                    println!("thread achieved nirvana");
-                },
                 _ => {}
             }
         }
@@ -435,17 +432,6 @@ impl<'a> Collector<'a> {
         // wait for the yuga to end
         println!("skipping wait");
     }
-
-    #[cfg(all(feature = "shuttle", test))]
-    /// Unfortunately, shuttle doesn't run thread-local destructors when threads
-    /// *exit*, only when they are *joined*. This makes it report spurious dead-locks
-    /// when the Collector calls recv() on the communications channel - under normal
-    /// operations the LocalSender is dropped by all mutator threads and Weak<T> drops
-    /// all live SyncSenders, causing recv() to unblock.
-    pub fn nirvana() {
-        LOCAL_SENDER.with(|l|{ l.chan.take(); });
-    }
-
 }
 
 /// As GC objects are dropped, threads send Souls to the global Collector via
@@ -461,8 +447,6 @@ pub enum Soul {
     /// A main thread wants to run a cycle collection immediately. Mostly used
     /// for testing.
     Yuga(Arc<(Mutex<bool>, Condvar)>),
-    /// A thread that had an open channel exitted.
-    Nirvana(()),
 }
 
 thread_local! {
@@ -479,7 +463,6 @@ impl Drop for LocalSender {
     fn drop(&mut self) {
         println!("drop");
         let Self { chan } = self;
-        //chan.borrow().as_ref().map(|chan| chan.send(Soul::Nirvana(())).unwrap());
         drop(chan);
     }
 }

@@ -141,7 +141,7 @@ impl<T: Send + Sync + 'static> Trace for List<T> {
 }
 
 fn choose<T>(vec: &Vec<T>) -> &T {
-    &vec[self::rand::thread_rng().gen_range(0, vec.len())]
+    &vec[self::rand::thread_rng().gen_range(0..vec.len())]
 }
 
 fn test_graph() {
@@ -172,7 +172,7 @@ fn test_graph() {
         println!("shrink {}", i);
         if i % SHRINK_DIV == 0 {
             //nodes.truncate(NODE_COUNT - i);
-            nodes.remove(self::rand::thread_rng().gen_range(0, nodes.len()));
+            nodes.remove(self::rand::thread_rng().gen_range(0..nodes.len()));
             Collector::maybe_yuga();
             let live = number_of_live_objects();
             println!("Now have {} datas and {} nodes", live, nodes.len());
@@ -199,9 +199,9 @@ fn test_list() {
 
     println!("Inserting randomly");
     for i in 0..ACTION_COUNT {
-        match self::rand::thread_rng().gen_range(0, 2) {
+        match self::rand::thread_rng().gen_range(0..=2) {
             //0 => list.get(thread_rng().gen_range(0, list.len)).unlink(&mut list),
-            1 => list.get(self::rand::thread_rng().gen_range(0, list.len)).link_next(Node::new(i), &mut list),
+            1 => list.get(self::rand::thread_rng().gen_range(0..=list.len-1)).link_next(Node::new(i), &mut list),
             _ => (),
         }
         Collector::maybe_yuga();
@@ -275,7 +275,6 @@ mod test {
         random(|| {
             mini_list();
             Collector::yuga();
-            Collector::nirvana();
             assert_eq!(crate::gc::number_of_live_objects(), 0);
         }, 100);
     }
@@ -285,7 +284,6 @@ mod test {
         random(|| {
             test_list();
             Collector::yuga();
-            Collector::nirvana();
             assert_eq!(crate::gc::number_of_live_objects(), 0);
         }, 100);
     }
@@ -295,9 +293,8 @@ mod test {
         shuttle::replay(|| {
             test_list();
             Collector::yuga();
-            Collector::nirvana();
             assert_eq!(crate::gc::number_of_live_objects(), 0);
-        }, "9101a607afebcb97a7b1e49c56000a0008008000002000000200800000800000200080000020000008000002000000002200000002002000000800f0bf20a0a2080a0a02208020028aa222aa8002808880a8a08282002a800aa002a8a020a81211550140144051555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555515400000");
+        }, "91019004a4b98099e9c7b29a59008a00000080000000020000200000200000000800000200000002008000000008000008000008000020000000020000020000080000f0170150401544510411551410040000155054044114010005554414111445220008aa08a228a28aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00");
     }
 
     #[test]
@@ -305,7 +302,6 @@ mod test {
         shuttle::check_random(|| {
             test_graph();
             Collector::yuga();
-            Collector::nirvana();
             assert_eq!(crate::gc::number_of_live_objects(), 0);
         }, 100);
     }
@@ -314,7 +310,6 @@ mod test {
     fn shuttle_fail_graph() {
         shuttle::replay(|| {
             test_graph();
-            Collector::nirvana();
         }, "");
     }
 }
