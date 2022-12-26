@@ -3,6 +3,8 @@ use crate::collector::{Collector, Soul, LOCAL_SENDER, SyncSender};
 
 use std::error::Error;
 
+use tracing::{debug, error, info, span, warn, Level, event};
+
 #[cfg(not(all(feature = "shuttle", test)))]
 pub use std::{thread, sync::{atomic::*, Arc, Weak, RwLock, RwLockReadGuard, RwLockWriteGuard}};
 #[cfg(all(feature = "shuttle", test))]
@@ -40,6 +42,12 @@ pub trait GcObject: Send + Sync {
 #[derive(Clone)]
 pub struct WeakRoot(pub(crate) Weak<dyn GcObject>);
 
+impl core::fmt::Debug for WeakRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.write_fmt(format_args!("WeakRoot({:?})", self.as_ptr()))
+    }
+}
+
 impl WeakRoot {
     pub fn visit(&self, c: &mut Collector) -> bool {
         // When we visit a WeakGc object from our defer list root, we have to
@@ -55,7 +63,7 @@ impl WeakRoot {
         // is definitely still reachable.
         let Some(upgraded) = self.0.upgrade() else {
             // we couldn't upgrade the weak reference, so it was a dead root object
-            println!("visited dead weakgc");
+            event!(Level::TRACE, "visited dead weakgc");
             return false;
         };
         upgraded.read_and_trace(self, c)
@@ -66,26 +74,21 @@ impl WeakRoot {
     }
 
     pub fn flags(&self) -> Option<GcFlags> {
-        println!("FLAGS");
-        //self.0.upgrade().map(|s| s.0.load(Ordering::Acquire) ).and_then(GcFlags::from_bits)
         self.0.upgrade().and_then(|s| s.flags())
     }
 
     pub fn mark_visited(&self) {
-        println!("MARK VISIT {:x}", self.0.as_ptr() as *const () as usize);
-        //self.0.upgrade().map(|s| s.0.store(GcFlags::VISITED.bits(), Ordering::Release));
-        self.0.upgrade().map(|s| { println!("MARK COULD UPGRADE"); s.mark_visited() });
+        event!(Level::TRACE, "MARK VISIT {:x}", self.0.as_ptr() as *const () as usize);
+        self.0.upgrade().map(|s| { s.mark_visited() });
     }
 
     pub fn clear_visited(&self) {
-        println!("CLEAR VISIT");
-        //self.0.upgrade().map(|s| s.0.store(GcFlags::NONE.bits(), Ordering::Release));
+        event!(Level::TRACE, "CLEAR VISIT");
         self.0.upgrade().map(|s| s.clear_visited());
     }
 
     pub fn invalidate(&self) {
-        println!("INVALIDATE");
-        //self.0.upgrade().map(|s| s.2.invalidate() );
+        event!(Level::TRACE, "INVALIDATE");
         self.0.upgrade().map(|s| s.invalidate());
     }
 }
@@ -99,7 +102,7 @@ impl<T: Trace> GcObject for (RwLock<Option<T>>, AtomicUsize, Tracker) {
             panic!("{} MUT", std::any::type_name::<T>());
         }
         let Ok(r) = self.0.try_read() else {
-            println!("can't acquire read-lock on weakgc");
+            event!(Level::TRACE, "can't acquire read-lock on weakgc");
             // We couldn't acquire a read-lock, so we know *something* else has
             // an outstanding lock. The collector doesn't hold guards, so it must
             // be a mutator, which means the object is still reachable.
@@ -109,13 +112,13 @@ impl<T: Trace> GcObject for (RwLock<Option<T>>, AtomicUsize, Tracker) {
             // We were able to acquire a read-lock, so we know it doesn't have a
             // write-lock outstanding. Now we visit the object to find all reachable
             // Gc<T> objects to add to our worklist.
-            println!("started tracing weakgc 0x{:x}", _self.as_ptr() as usize);
+            event!(Level::DEBUG, "started tracing weakgc 0x{:x}", _self.as_ptr() as usize);
             reader.trace(_self, c);
             true
         } else {
             // we got a read-lock, but the object is None - this should only
             // happen if we already broke a cycle somehow.
-            println!("empty weakgc");
+            event!(Level::WARN, "empty weakgc");
             false
         };
         // these drops matter, so make them explicit: in particular upgraded being
@@ -144,7 +147,7 @@ impl<T: Trace> GcObject for (RwLock<Option<T>>, AtomicUsize, Tracker) {
 
 impl<T: Trace> Clone for Gc<T> {
     fn clone(&self) -> Self {
-        println!("GC CLONE 0x{:x}", self.as_ptr() as usize);
+        event!(Level::TRACE, "GC CLONE 0x{:?}", self.as_ptr());
         Gc { item: self.item.clone() }
     }
 }
@@ -265,7 +268,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
         if crate::collector::IS_COLLECTOR.with(|b|{ b.load(Ordering::Acquire) }) {
             // the collector thread upgrades and downgrades its weak handles a lot,
             // and they should never be added to the deferred list.
-            println!("dropping gc on collector thread");
+            event!(Level::TRACE, "dropping gc on collector thread");
             return drop(&mut self.item);
         }
         // See [Defer List]
@@ -282,7 +285,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 // collector finishes - there's probably some weird cache we could
                 // do to mitigate that if it's a problem e.g. while collection
                 // is happening add/remove to a per-cpu hashmap instead)
-                println!("reclaiming soul");
+                event!(Level::DEBUG, "reclaiming soul");
                 let ptr = Arc::as_ptr(&self.item);
                 LOCAL_SENDER.with(|s| {
                     let rec = s.chan.borrow().as_ref().unwrap().send(Soul::Reclaimed(ptr as usize));
@@ -295,7 +298,7 @@ impl<T: Trace + 'static> Drop for Gc<T> {
                 // We know it didn't have a weak count, so wasn't added to
                 // the defer list. We just clean up the object entirely.
                 // Fall through to the normal Arc drop.
-                println!("immediate free");
+                event!(Level::TRACE, "immediate free");
             }
         } else {
             // We're dropping an object, and it is possibly the member of a cycle
@@ -340,7 +343,7 @@ impl<T: Trace> Gc<T> {
                 Ordering::Acquire, // TODO: think about atomic orderings
                 Ordering::Relaxed);
             if let Err(actual) = res {
-                println!("gc drop cmpxchg failed compare, was instead {:?}", GcFlags::from_bits(actual));
+                event!(Level::TRACE, "gc drop cmpxchg failed compare, was instead {:?}", GcFlags::from_bits(actual));
             }
         }
     }
@@ -361,7 +364,7 @@ impl<T: Trace> Gc<T> {
     /// may panic due to attempting to dereference a Gc pointer that has been nullified
     /// in order to break cycles - however, in normal operations, it will not panic.
     pub fn get<F, O>(&self, f: F) -> O where F: Fn(&T) -> O {
-        println!("get on 0x{:x}", self.as_ptr() as usize);
+        event!(Level::TRACE, "get on 0x{:x}", self.as_ptr() as usize);
         // See [Moving Reference]
         if <Self as Trace>::MUT {
             //self.visited_to_dirty();

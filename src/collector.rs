@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 
 use im::{HashSet, HashMap, OrdSet, OrdMap};
 use roaring::RoaringBitmap;
+use tracing::{debug, error, info, span, warn, Level, event};
 
 #[cfg(all(feature = "shuttle", test))]
 use shuttle::thread_local;
@@ -125,7 +126,8 @@ enum Component {
 
 impl<'a> Collector<'a> {
     fn collect(&mut self) {
-        println!("ENTER COLLECT");
+        let start = span!(Level::INFO, "Collector::collect");
+        let _start = start.enter();
         let mut roots = OrdMap::new();
         // save the initial root set of nodes we have to visit
         // also clear the deferred list, so that the OrdMap::diff later finds
@@ -135,29 +137,32 @@ impl<'a> Collector<'a> {
         let mut to_visit: VecDeque<(*const (), Root)> = VecDeque::new();
         let mut alive = HashSet::<*const ()>::new();
         for root in roots.clone() {
+            let _root = span!(Level::TRACE, "Starting visit from root", root = root.0 as usize);
+            let _root_scope = _root.enter();
             to_visit.push_front(root);
             while let Some((ptr, item)) = to_visit.pop_front() {
-                println!("visit start for item {:?}", ptr);
+                let visit = span!(Level::DEBUG, "Visit item", ?ptr);
+                let _visit_scope = visit.enter();
                 // skip the item if we already visited it or it's been deallocated
                 if alive.contains(&ptr) {
-                    println!("skipping already known unvisitable node {:?}", ptr);
+                    event!(Level::TRACE, ?ptr, "skipping already known unvisitable node");
                     continue;
                 }
                 let visited = item.0.flags().map(|flag| flag.contains(GcFlags::VISITED));
                 if visited == None {
                     // we couldn't update the weak reference, mark it so we drop
                     // the weak reference in the eager alive dropping phase
-                    println!("skipping dead root {:?}", ptr);
+                    event!(Level::TRACE, ?ptr, "skipping dead root");
                     alive.insert(ptr);
                     continue;
                 }
                 if visited == Some(true) {
-                    println!("skipping frontier item {:?}", ptr);
+                    event!(Level::TRACE, ?ptr, "skipping frontier item");
                     continue;
                 }
                 // snapshot of all the known nodes
                 let snap = self.deferred.clone();
-                println!("visiting {:?}", item.0.as_ptr());
+                event!(Level::DEBUG, "visiting {:?}", item.0.as_ptr());
                 self.add_node(&item.0);
                 item.0.mark_visited();
                 let visited = item.0.flags();
@@ -179,7 +184,9 @@ impl<'a> Collector<'a> {
                     im::ordmap::DiffItem::Remove(_o, _i) => panic!(),
                 }).collect();
                 to_visit.extend(items);
+                drop(_visit_scope);
             }
+            drop(_root_scope);
         }
         let binding = self.visited.clone();
         let pre_nodes = binding.iter().collect();
@@ -210,8 +217,11 @@ impl<'a> Collector<'a> {
         // is live. when we find live objects we also do a traversal from it in
         // order to mark all objects reachable from it as also live, since they
         // are transitively reachable from the mutator as well.
+        let _reach = span!(Level::DEBUG, "Propogating reachability from alive nodes");
+        let _reach_scope = _reach.enter();
         'visit: for (ptr, row) in &self.visited {
-            println!("'visit {:?}", ptr);
+            let _reach_item = span!(Level::DEBUG, "reachability visit", ?ptr);
+            let _reach_item_scope = _reach_item.enter();
             // if the node is already marked alive, we're done with it
             if alive_ids.contains(&row.0) {
                 continue;
@@ -238,7 +248,7 @@ impl<'a> Collector<'a> {
                     break 'check_live;
                 }
             };
-            println!("found new alive root node {:?}", ptr);
+            event!(Level::DEBUG, "found new alive root node {:?}", ptr);
             alive_ids.insert(row.0);
             to_visit_ids.push_front(row.0);
             while let Some(outgoing) = to_visit_ids.pop_back() {
@@ -250,6 +260,7 @@ impl<'a> Collector<'a> {
                     if alive_ids.contains(&NodeId(outgoing_neighbor)) {
                         continue;
                     }
+                    event!(Level::TRACE, "found new alive child node {}", outgoing_neighbor);
                     graph_nodes[outgoing_neighbor as usize] = GraphNode::Reachable;
                     alive_ids.insert(NodeId(outgoing_neighbor));
                     to_visit_ids.push_front(NodeId(outgoing_neighbor));
@@ -257,6 +268,7 @@ impl<'a> Collector<'a> {
                 //TODO: we can free the weak_ref for alive visited nodes here too probably
             }
         }
+        drop(_reach_scope);
 
         #[cfg(feature = "graphviz")]
         self.draw_graph(pre_nodes, graph_nodes, graph_edges);
@@ -267,7 +279,7 @@ impl<'a> Collector<'a> {
             node.0.clear_visited();
 
             if !alive_ids.contains(&row.0) {
-                println!("got dead node {:?}", ptr);
+                event!(Level::INFO, "got dead node {:?}", ptr);
                 node.0.invalidate();
             }
         }
@@ -278,7 +290,6 @@ impl<'a> Collector<'a> {
             assert!(node.1.0.flags().map(|f| f != GcFlags::NONE) != Some(true),
                 "still marked node #{} {:?}", self.visited[node.0].0.0, node.0);
         }
-        println!("done");
 
         // We can now reset our working sets of objects; possibly-cyclic data
         // from the worker threads will all be added later since it's buffered
@@ -321,7 +332,7 @@ impl<'a> Collector<'a> {
             CommandArg::Format(Format::Pdf),
             CommandArg::Output("./samsara_graph.pdf".to_string())
         ]).unwrap();
-        println!("outputted graph {}", graph_svg);
+        event!(Level::INFO, "outputted graph {}", graph_svg);
     }
 
     #[cfg(not(feature = "graphviz"))]
@@ -334,7 +345,7 @@ impl<'a> Collector<'a> {
         let mut novel = false;
         self.visited.entry(root.as_ptr()).or_insert_with(|| {
             // We didn't already visit the gc object
-            println!("got new node {:?}", root.as_ptr());
+            event!(Level::TRACE, "got new node {:?}", root.as_ptr());
             //root.mark_visited();
             self.deferred.entry(root.as_ptr()).or_insert_with(|| {
                 Root(root.clone(), PhantomData)
@@ -351,7 +362,7 @@ impl<'a> Collector<'a> {
 
     pub fn add_edge(&mut self, root: &WeakRoot, item: WeakRoot) {
         // XXX: this has absolutely terrible cache locality
-        println!("got edge {:?}->{:?}", root.as_ptr(), item.as_ptr());
+        event!(Level::TRACE, "got edge {:?}->{:?}", root.as_ptr(), item.as_ptr());
         let root_idx = self.visited.entry(root.as_ptr()).or_insert_with(|| panic!() ).0;
         let item_row = self.visited.entry(item.as_ptr()).or_insert_with(|| panic!() );
         // increment the item's incoming count
@@ -362,27 +373,28 @@ impl<'a> Collector<'a> {
 
     fn process(&mut self, receiver: Receiver<Soul>) {
         while let Ok(soul) = { receiver.recv() }{
-            println!("collector received soul");
+            let _process = span!(Level::TRACE, "Collector received soul", ?soul);
+            let _process_scope = _process.enter();
             match soul {
                 Soul::Died(d) => {
                     match d.as_ptr() as usize {
                         // We could've been given a Weak<T> that has since been dropped
                         0 => (),
                         ptr => {
-                            println!("got possibly-cyclic object 0x{:x}", ptr);
+                            event!(Level::TRACE, "got possibly-cyclic object 0x{:x}", ptr);
                             self.deferred.entry(d.as_ptr()).or_insert_with(|| {
-                                println!("inserting");
+                                event!(Level::TRACE, "inserting");
                                 Root(d, PhantomData)
                             });
                         }
                     }
                 },
                 Soul::Reclaimed(d) => {
-                    println!("told about a definitely not cyclic object 0x{:x}", d);
+                    event!(Level::TRACE, "told about a definitely not cyclic object 0x{:x}", d);
                     self.deferred.remove(&(d as *const ()));
                 },
                 Soul::Yuga(b) => {
-                    println!("triggering yuga");
+                    event!(Level::TRACE, "triggering yuga");
                     self.collect();
                     // signal to all listeners that the yuga ended
                     *b.0.lock().unwrap() = true;
@@ -391,7 +403,7 @@ impl<'a> Collector<'a> {
                 _ => {}
             }
         }
-        println!("collector exiting");
+        event!(Level::INFO, "Collector exiting");
     }
 
     /// Start the collector thread.
@@ -411,13 +423,13 @@ impl<'a> Collector<'a> {
     /// Trigger a cycle collection.
     pub fn yuga() {
         let b = Arc::new((Mutex::new(false), Condvar::new()));
-        println!("mutator forcing collection");
+        let _force = span!(Level::DEBUG, "Mutator forcing collection");
+        let _force_scope = _force.enter();
         LOCAL_SENDER.with(|l| l.chan.borrow().as_ref().unwrap().send(Soul::Yuga(b.clone())) ).unwrap();
 
         // wait for the yuga to end
         let mut lock = b.0.lock().unwrap();
         while !*lock { lock = b.1.wait(lock).unwrap(); }
-        println!("collection done");
     }
 
     //#[cfg(all(feature = "shuttle", test))]
@@ -425,18 +437,20 @@ impl<'a> Collector<'a> {
     pub fn maybe_yuga() {
         use self::rand::Rng;
         if self::rand::thread_rng().gen::<bool>() == false { return ; }
+        let _force = span!(Level::DEBUG, "Mutator forcing non-blocking collection");
+        let _force_scope = _force.enter();
         let b = Arc::new((Mutex::new(false), Condvar::new()));
-        println!("mutator forcing non-blocking collection");
         LOCAL_SENDER.with(|l| l.chan.borrow().as_ref().unwrap().send(Soul::Yuga(b.clone())) ).unwrap();
 
         // wait for the yuga to end
-        println!("skipping wait");
+        event!(Level::TRACE, "skipping wait");
     }
 }
 
 /// As GC objects are dropped, threads send Souls to the global Collector via
 /// channel; the collector thread then processes the souls, and occasionally
 /// triggers cycle detection.
+#[derive(Debug)]
 pub enum Soul {
     /// A possibly-cyclic object died, and must be added to the defer list for
     /// cycle checking later.
@@ -461,7 +475,7 @@ pub struct LocalSender {
 
 impl Drop for LocalSender {
     fn drop(&mut self) {
-        println!("drop");
+        event!(Level::TRACE, "drop");
         let Self { chan } = self;
         drop(chan);
     }

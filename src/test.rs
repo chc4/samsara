@@ -2,6 +2,7 @@ use crate::gc::{Gc, WeakRoot};
 use crate::trace::Trace;
 use crate::gc::number_of_live_objects;
 use crate::collector::Collector;
+use test_log::test;
 
 //#[cfg(not(all(feature = "shuttle", test)))]
 //use {rand, rand::*};
@@ -270,7 +271,7 @@ mod test {
         runner.run(f);
     }
 
-    #[test]
+    #[self::test]
     fn shuttle_test_mini() {
         random(|| {
             mini_list();
@@ -279,7 +280,7 @@ mod test {
         }, 100);
     }
 
-    #[test]
+    #[self::test]
     fn shuttle_test_list() {
         random(|| {
             test_list();
@@ -288,7 +289,7 @@ mod test {
         }, 100);
     }
 
-    #[test]
+    #[self::test]
     fn shuttle_fail_list() {
         shuttle::replay(|| {
             test_list();
@@ -297,7 +298,7 @@ mod test {
         }, "91019004a4b98099e9c7b29a59008a00000080000000020000200000200000000800000200000002008000000008000008000008000020000000020000020000080000f0170150401544510411551410040000155054044114010005554414111445220008aa08a228a28aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00");
     }
 
-    #[test]
+    #[self::test]
     fn shuttle_test_graph() {
         shuttle::check_random(|| {
             test_graph();
@@ -306,7 +307,7 @@ mod test {
         }, 100);
     }
 
-    #[test]
+    #[self::test]
     fn shuttle_fail_graph() {
         shuttle::replay(|| {
             test_graph();

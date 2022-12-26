@@ -13,6 +13,7 @@ roaring = "0.10.1"
 shuttle = { version = "0.5", optional = true }
 rand = "0.8.5"
 graphviz-rust = { version = "0.4.0", optional = true }
+tracing = "0.1"
 
 [features]
 shuttle = ["dep:shuttle"]
@@ -21,3 +22,8 @@ default = ["graphviz"]
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.5"
+
+[dev-dependencies]
+env_logger = "*"
+tracing-subscriber = {version = "0.3", default-features = false, features = ["env-filter", "fmt"]}
+test-log = { version = "0.2.11", features = ["trace"]}
