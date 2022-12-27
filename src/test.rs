@@ -245,7 +245,7 @@ fn mini_list() {
 mod test {
     use super::*;
 
-    #[test]
+    #[self::test]
     fn normal_test_list() {
         test_list();
         Collector::yuga();

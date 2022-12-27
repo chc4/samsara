@@ -365,7 +365,7 @@ impl<T: Trace> Gc<T> {
     /// If used in the Drop impl of an object contained within a Gc<T>, this method
     /// may panic due to attempting to dereference a Gc pointer that has been nullified
     /// in order to break cycles - however, in normal operations, it will not panic.
-    pub fn get<'a, F, O>(&self, o: &'a Owner<T>, f: F) -> O where F: Fn(&T) -> O {
+    pub fn get<'a, F, O>(&self, o: &'a Owner<T>, f: F) -> O where F: FnOnce(&T) -> O {
         // If the object is interiorally mutable, than the collect will
         // acquire a write-lock when doing tracing in order to handle
         // [Moving Reference], meaning try_read() may spuriously fail; we
@@ -374,20 +374,24 @@ impl<T: Trace> Gc<T> {
             return self.get_blocking(f)
         }
 
-        self.get_operation(|lock| {
+        self.get_operation(move |lock| {
+            // We have an &Owner<T>, and thus there can't be an outstanding
+            // &mut Owner<T> for a set() operation that would block us (unless
+            // someone is using force_set(), in which case it's their fault if we
+            // deadlock).
             lock.try_read().unwrap()
         }, f)
     }
 
     /// Get a read-only view of the contents of a Gc<T> object. This method is the
     /// same as [[Gc::get]], and thus may cause dead-locks if used incorrectly.
-    pub fn get_blocking<F, O>(&self, f: F) -> O where F: Fn(&T) -> O {
-        self.get_operation(|lock| lock.read().unwrap(), f)
+    pub fn get_blocking<F, O>(&self, f: F) -> O where F: FnOnce(&T) -> O {
+        self.get_operation(move |lock| lock.read().unwrap(), f)
     }
 
     // Internal get() operation helper
     fn get_operation<READ, F, O>(&self, read: READ, f: F) -> O where
-        F: Fn(&T) -> O,
+        F: FnOnce(&T) -> O,
         READ: Fn(&RwLock<Option<T>>) -> RwLockReadGuard<'_, Option<T>>
     {
         event!(Level::TRACE, "get on 0x{:x}", self.as_ptr() as usize);
@@ -404,7 +408,7 @@ impl<T: Trace> Gc<T> {
     ///
     /// This operation may temporarily block on the cycle collector tracing the
     /// object on another thread.
-    pub fn set<'a, F, O>(&self, o: &'a mut Owner<T>, f: F) -> O where F: Fn(&mut T) -> O {
+    pub fn set<'a, F, O>(&self, o: &'a mut Owner<T>, f: F) -> O where F: FnOnce(&mut T) -> O {
         // This is actually just the same as force_set! The extra parameter is
         // the only difference, but enforces an extra constraint on the caller.
         self.force_set(f)
@@ -413,15 +417,7 @@ impl<T: Trace> Gc<T> {
     /// Get a mutable view of the contents of the Gc<T> object. This method is the
     /// same as [[Gc::set]] except for **not** taking an Owner<T>, and thus may cause
     /// deadlocks if used incorrectly.
-    pub fn force_set<F, O>(&self, f: F) -> O where F: Fn(&mut T) -> O {
-        self.set_operation(|lock| lock.write().unwrap(), f)
-    }
-
-    // Internal set() operation helper
-    fn set_operation<WRITE, F, O>(&self, write: WRITE, f: F) -> O where
-        F: Fn(&mut T) -> O,
-        WRITE: Fn(&RwLock<Option<T>>) -> RwLockWriteGuard<'_, Option<T>>
-    {
+    pub fn force_set<F, O>(&self, mut f: F) -> O where F: FnOnce(&mut T) -> O {
         let mut binding = self.item.0.write().unwrap();
         let locked = binding.as_mut().unwrap();
         // See [Moving Reference]

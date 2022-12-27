@@ -58,14 +58,17 @@ mod tests {
 
     #[test]
     fn simple_bar() {
+        let mut token = Owner::wait_for_new();
         let item = Gc::new(Bar { b: 0, bar: vec![] });
-        assert_eq!(item.get(|i| i.b), 0);
-        item.set(|i| i.b = 1);
-        assert_eq!(item.get(|i| i.b), 1);
+        assert_eq!(item.get(&token, |i| i.b), 0);
+        item.set(&mut token, |i| i.b = 1);
+        assert_eq!(item.get(&token, |i| i.b), 1);
     }
 
     #[test]
     fn simple_foo() {
+        let mut token = Owner::wait_for_new();
+        let mut foo_token = Owner::wait_for_new();
         let bar = Gc::new(Bar { b: 0, bar: vec![] });
         let foo = Gc::new(Foo { a: 0,
             bar: bar.clone(),
@@ -74,17 +77,17 @@ mod tests {
             foo3: Gc::empty(),
         });
         println!("1");
-        assert_eq!(bar.get(|i| i.b), 0);
-        bar.set(|i| i.b = 1);
+        assert_eq!(bar.get(&token, |i| i.b), 0);
+        bar.set(&mut token, |i| i.b = 1);
         println!("2");
-        assert_eq!(bar.get(|i| i.b), 1);
-        assert_eq!(foo.get(|i| i.bar.get(|i2| i2.b)), 1);
+        assert_eq!(bar.get(&token, |i| i.b), 1);
+        assert_eq!(foo.get(&foo_token, |i| i.bar.get(&token, |i2| i2.b)), 1);
         println!("3");
         drop(foo);
         println!("4");
         Collector::yuga();
         println!("5");
-        assert_eq!(bar.get(|i| i.b), 1);
+        assert_eq!(bar.get(&token, |i| i.b), 1);
         drop(bar);
         println!("6");
         Collector::yuga();
@@ -93,12 +96,13 @@ mod tests {
 
     #[test]
     fn simple_cyclic() {
+        let mut token = Owner::wait_for_new();
         let a1 = Gc::new(Bar { b: 0, bar: vec![] });
         let a2 = Gc::new(Bar { b: 1, bar: vec![] });
         let a3 = Gc::new(Bar { b: 2, bar: vec![] });
-        a1.set(|a| a.bar = vec![a2.clone()]);
-        a2.set(|a| a.bar = vec![a3.clone()]);
-        a3.set(|a| a.bar = vec![a1.clone()]);
+        a1.set(&mut token, |a| a.bar = vec![a2.clone()]);
+        a2.set(&mut token, |a| a.bar = vec![a3.clone()]);
+        a3.set(&mut token, |a| a.bar = vec![a1.clone()]);
         println!("1");
         drop(a1);
         Collector::yuga();
@@ -113,17 +117,18 @@ mod tests {
 
     #[test]
     fn held_cyclic() {
+        let mut token = Owner::wait_for_new();
         let a1 = Gc::new(Bar { b: 0, bar: vec![] });
         let a2 = Gc::new(Bar { b: 1, bar: vec![] });
         let a3 = Gc::new(Bar { b: 2, bar: vec![] });
-        a1.set(|a| a.bar = vec![a2.clone()]);
-        a2.set(|a| a.bar = vec![a3.clone()]);
-        a3.set(|a| a.bar = vec![a1.clone()]);
+        a1.set(&mut token, |a| a.bar = vec![a2.clone()]);
+        a2.set(&mut token, |a| a.bar = vec![a3.clone()]);
+        a3.set(&mut token, |a| a.bar = vec![a1.clone()]);
         println!("1");
         drop(a1);
         drop(a2);
         println!("2");
-        a3.set(|a| {
+        a3.set(&mut token, |a| {
             Collector::yuga();
             drop(a);
         });
@@ -131,13 +136,14 @@ mod tests {
 
     #[test]
     fn downstream_of_cyclic_1() {
+        let mut token = Owner::wait_for_new();
         let a1 = Gc::new(Bar { b: 0, bar: vec![] });
         let a2 = Gc::new(Bar { b: 1, bar: vec![] });
         let a3 = Gc::new(Bar { b: 2, bar: vec![] });
         let live = Gc::new(Bar { b: 3, bar: vec![] });
-        a1.set(|a| a.bar = vec![a2.clone()]);
-        a2.set(|a| a.bar = vec![a3.clone()]);
-        a3.set(|a| a.bar = vec![a1.clone()]);
+        a1.set(&mut token, |a| a.bar = vec![a2.clone()]);
+        a2.set(&mut token, |a| a.bar = vec![a3.clone()]);
+        a3.set(&mut token, |a| a.bar = vec![a1.clone()]);
         println!("1");
         drop(a1);
         drop(a2);
@@ -147,19 +153,20 @@ mod tests {
         println!("3");
         Collector::yuga();
         println!("4");
-        assert_eq!(live.get(|l| l.b), 3);
+        assert_eq!(live.get(&token, |l| l.b), 3);
         assert_eq!(gc::number_of_live_objects(), 1);
     }
 
     #[test]
     fn downstream_of_cyclic_2() {
+        let mut token = Owner::wait_for_new();
         let a1 = Gc::new(Bar { b: 0, bar: vec![] });
         let a2 = Gc::new(Bar { b: 1, bar: vec![] });
         let a3 = Gc::new(Bar { b: 2, bar: vec![] });
         let live = Gc::new(Bar { b: 3, bar: vec![] });
-        a1.set(|a| a.bar = vec![a3.clone()]);
-        a2.set(|a| a.bar = vec![a1.clone()]);
-        a3.set(|a| a.bar = vec![a2.clone()]);
+        a1.set(&mut token, |a| a.bar = vec![a3.clone()]);
+        a2.set(&mut token, |a| a.bar = vec![a1.clone()]);
+        a3.set(&mut token, |a| a.bar = vec![a2.clone()]);
         println!("1");
         drop(a1);
         drop(a2);
@@ -169,12 +176,13 @@ mod tests {
         println!("3");
         Collector::yuga();
         println!("4");
-        assert_eq!(live.get(|l| l.b), 3);
+        assert_eq!(live.get(&token, |l| l.b), 3);
         assert_eq!(gc::number_of_live_objects(), 1);
     }
 
     #[test]
     fn two_cycles_join() {
+        let mut token = Owner::wait_for_new();
         struct Join { a: Gc<Bar>, b: Gc<Bar> }
         impl Trace for Join {
             fn trace(&self, root: &WeakRoot, c: &mut Collector) {
@@ -186,16 +194,16 @@ mod tests {
             let a1 = Gc::new(Bar { b: 0, bar: vec![] });
             let a2 = Gc::new(Bar { b: 1, bar: vec![] });
             let a3 = Gc::new(Bar { b: 2, bar: vec![] });
-            a1.set(|a| a.bar = vec![a2.clone()]);
-            a2.set(|a| a.bar = vec![a3.clone()]);
-            a3.set(|a| a.bar = vec![a1.clone()]);
+            a1.set(&mut token, |a| a.bar = vec![a2.clone()]);
+            a2.set(&mut token, |a| a.bar = vec![a3.clone()]);
+            a3.set(&mut token, |a| a.bar = vec![a1.clone()]);
 
             let b1 = Gc::new(Bar { b: 3, bar: vec![] });
             let b2 = Gc::new(Bar { b: 4, bar: vec![] });
             let b3 = Gc::new(Bar { b: 5, bar: vec![] });
-            b1.set(|b| b.bar = vec![b2.clone()]);
-            b2.set(|b| b.bar = vec![b3.clone()]);
-            b3.set(|b| b.bar = vec![b1.clone()]);
+            b1.set(&mut token, |b| b.bar = vec![b2.clone()]);
+            b2.set(&mut token, |b| b.bar = vec![b3.clone()]);
+            b3.set(&mut token, |b| b.bar = vec![b1.clone()]);
 
             Gc::new(Join { a: a1.clone(), b: b1.clone() })
         };
@@ -211,26 +219,28 @@ mod tests {
 
     #[test]
     fn two_cycles_meet() {
+        let mut token = Owner::wait_for_new();
+        let mut root_token = Owner::wait_for_new();
         let root = {
             let meet = Gc::new(Bar { b: 123, bar: vec![] });
             let a1 = Gc::new(Bar { b: 0, bar: vec![] });
             let a2 = Gc::new(Bar { b: 1, bar: vec![] });
             let a3 = Gc::new(Bar { b: 2, bar: vec![] });
-            a1.set(|a| a.bar = vec![a2.clone()]);
-            a2.set(|a| a.bar = vec![a3.clone()]);
-            a3.set(|a| a.bar = vec![a1.clone(), meet.clone()]);
+            a1.set(&mut token, |a| a.bar = vec![a2.clone()]);
+            a2.set(&mut token, |a| a.bar = vec![a3.clone()]);
+            a3.set(&mut token, |a| a.bar = vec![a1.clone(), meet.clone()]);
 
             let b1 = Gc::new(Bar { b: 3, bar: vec![] });
             let b2 = Gc::new(Bar { b: 4, bar: vec![] });
             let b3 = Gc::new(Bar { b: 5, bar: vec![] });
-            b1.set(|b| b.bar = vec![b2.clone()]);
-            b2.set(|b| b.bar = vec![b3.clone()]);
-            b3.set(|b| b.bar = vec![b1.clone(), meet.clone()]);
+            b1.set(&mut token, |b| b.bar = vec![b2.clone()]);
+            b2.set(&mut token, |b| b.bar = vec![b3.clone()]);
+            b3.set(&mut token, |b| b.bar = vec![b1.clone(), meet.clone()]);
             b2
         };
 
         println!("1");
-        root.get(|r| r.bar[0].set(|b| Collector::yuga()));
+        root.get(&root_token, move |r| r.bar[0].set(&mut token, |b| Collector::yuga()));
         assert_eq!(gc::number_of_live_objects(), 4);
         println!("2");
         drop(root);
@@ -242,19 +252,20 @@ mod tests {
 
     #[test]
     fn weird() {
+        let mut token = Owner::wait_for_new();
         // a0 -> a1 -> a2 -> a4 -> a5
         //       a3 -^
         let a0 = new(0);
         let a1 = new(1);
-        a0.set(|a| a.bar.push(Gc::clone(&a1)));
+        a0.set(&mut token, |a| a.bar.push(Gc::clone(&a1)));
         let a2 = new(2);
-        a1.set(|a| a.bar.push(Gc::clone(&a2)));
+        a1.set(&mut token, |a| a.bar.push(Gc::clone(&a2)));
         let a3 = new(3);
         let a4 = new(4);
-        a3.set(|a| a.bar.push(Gc::clone(&a4)));
-        a1.set(|a| a.bar.push(Gc::clone(&a4)));
+        a3.set(&mut token, |a| a.bar.push(Gc::clone(&a4)));
+        a1.set(&mut token, |a| a.bar.push(Gc::clone(&a4)));
         let a5 = new(5);
-        a4.set(|a| a.bar.push(Gc::clone(&a5)));
+        a4.set(&mut token, |a| a.bar.push(Gc::clone(&a5)));
         drop(a0.clone());
         drop(a1.clone());
         drop(a2.clone());
@@ -267,9 +278,10 @@ mod tests {
 
     #[test]
     fn two_edges() {
+        let mut token = Owner::wait_for_new();
         let a0 = new(0);
         let a1 = new(1);
-        a0.set(|a|{ a.bar.push(Gc::clone(&a1)); a.bar.push(Gc::clone(&a1)); });
+        a0.set(&mut token, |a|{ a.bar.push(Gc::clone(&a1)); a.bar.push(Gc::clone(&a1)); });
         drop(a1);
         Collector::yuga();
         assert_eq!(gc::number_of_live_objects(), 1);
@@ -277,8 +289,9 @@ mod tests {
 
     #[test]
     fn self_reference() {
+        let mut token = Owner::wait_for_new();
         let a0 = new(0);
-        a0.set(|a| a.bar.push(Gc::clone(&a0)));
+        a0.set(&mut token, |a| a.bar.push(Gc::clone(&a0)));
         drop(a0);
         Collector::yuga();
         assert_eq!(gc::number_of_live_objects(), 0);
