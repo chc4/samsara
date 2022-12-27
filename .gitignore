@@ -1,2 +1,5 @@
 /target
 /Cargo.lock
+samsara_graph.pdf
+**/perf.data*
+**/flamegraph.svg
