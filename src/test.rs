@@ -1,4 +1,4 @@
-use crate::gc::{Gc, WeakRoot};
+use crate::gc::{Gc, WeakRoot, Owner};
 use crate::trace::Trace;
 use crate::gc::number_of_live_objects;
 use crate::collector::Collector;
@@ -43,27 +43,27 @@ impl<T: Send + Sync + 'static> Node<T> {
 
 impl<T: Send + Sync + 'static> Gc<Node<T>> {
     /// Set node to the next link in the list containing self
-    fn link_next(&self, mut node: Node<T>, list: &mut List<T>) {
-        let node = if let Some(curr_next) = self.get(|s| s.next.clone() ) {
+    fn link_next(&self, token: &mut Owner<Node<T>>, mut node: Node<T>, list: &mut List<T>) {
+        let node = if let Some(curr_next) = self.get(token, |s| s.next.clone() ) {
             assert!(curr_next.as_ptr() != self.as_ptr(), "self-reference");
             node.next = Some(curr_next.clone());
             node.prev = Some(self.clone());
 
             let mut node = Gc::new(node);
-            curr_next.set(|n| n.prev = Some(node.clone()) );
+            curr_next.set(token, |n| n.prev = Some(node.clone()) );
             node
         } else {
             Gc::new(node)
         };
-        self.set(|s| s.next = Some(node.clone()));
+        self.set(token, |s| s.next = Some(node.clone()));
         list.len += 1;
     }
 
-    fn unlink(&self, list: &mut List<T>) {
-        let (curr_next, curr_prev) = self.get(|s| (s.next.clone(), s.prev.clone()) );
+    fn unlink(&self, token: &mut Owner<Node<T>>, list: &mut List<T>) {
+        let (curr_next, curr_prev) = self.get(token, |s| (s.next.clone(), s.prev.clone()) );
         // TODO: do we want a set_two that sorts locks+tries to acquire both, for coherency?
-        curr_next.as_ref().map(|c| c.set(|c| c.prev = curr_prev.clone()));
-        curr_prev.as_ref().map(|c| c.set(|c| c.next = curr_next.clone()));
+        curr_next.as_ref().map(|c| c.set(token, |c| c.prev = curr_prev.clone()));
+        curr_prev.as_ref().map(|c| c.set(token, |c| c.next = curr_next.clone()));
         if let Some(list_head) = list.head.clone() {
             if list_head.as_ptr() == self.as_ptr() {
                 list.head = curr_next.clone();
@@ -89,12 +89,12 @@ impl<T: Send + Sync + 'static> List<T> {
         Self { head: None, tail: None, len: 0 }
     }
 
-    fn push_head(&mut self, val: T) {
+    fn push_head(&mut self, token: &mut Owner<Node<T>>, val: T) {
         let mut node = Node::new(val);
         node.next = self.head.clone();
 
         let new_head = Gc::new(node);
-        self.head.as_ref().map(|head| head.set(|i| i.prev = Some(new_head.clone()) ));
+        self.head.as_ref().map(|head| head.set(token, |i| i.prev = Some(new_head.clone()) ));
         if let None = self.tail {
             self.tail = Some(new_head.clone());
         }
@@ -102,11 +102,11 @@ impl<T: Send + Sync + 'static> List<T> {
         self.len += 1;
     }
 
-    fn push_tail(&mut self, val: T) {
+    fn push_tail(&mut self, token: &mut Owner<Node<T>>, val: T) {
         let mut node = Node::new(val);
         node.prev = self.tail.clone();
         let new_tail = Gc::new(node);
-        self.tail.as_ref().map(|tail| tail.set(|i| i.next = Some(new_tail.clone()) ));
+        self.tail.as_ref().map(|tail| tail.set(token, |i| i.next = Some(new_tail.clone()) ));
         if let None = self.head {
             self.head = Some(new_tail.clone());
         }
@@ -118,10 +118,10 @@ impl<T: Send + Sync + 'static> List<T> {
         self.head.clone()
     }
 
-    fn get(&self, i: usize) -> Gc<Node<T>> {
+    fn get(&self, token: &Owner<Node<T>>, i: usize) -> Gc<Node<T>> {
         let mut head = self.head.clone();
         for _ in 0..i {
-            head = head.unwrap().get(|c| c.next.clone());
+            head = head.unwrap().get(token, |c| c.next.clone());
         }
         head.unwrap()
     }
@@ -147,6 +147,7 @@ fn choose<T>(vec: &Vec<T>) -> &T {
 
 fn test_graph() {
     println!("Creating nodes...");
+    let mut token = Owner::new();
     let mut nodes = Vec::new();
 
     for i in 0..=NODE_COUNT {
@@ -165,7 +166,7 @@ fn test_graph() {
         if a.as_ptr() == b.as_ptr() { continue; }
 
         println!("add edge {:x} -> {:x}", a as *const _ as usize, b as *const _ as usize);
-        a.set(|a|{ Collector::maybe_yuga(); a.edges.push(Gc::clone(&b)) });
+        a.set(&mut token, |a|{ Collector::maybe_yuga(); a.edges.push(Gc::clone(&b)) });
     }
 
     println!("Doing the shrink...");
@@ -178,7 +179,7 @@ fn test_graph() {
             let live = number_of_live_objects();
             println!("Now have {} datas and {} nodes", live, nodes.len());
             for node in &nodes {
-                let label = node.get(|n| n.label.len() );
+                let label = node.get(&token, |n| n.label.len() );
                 assert_ne!(label, 0);
             }
             // TODO: Add an assert here. this isn't correct: objects can
@@ -193,37 +194,39 @@ const LIST_COUNT: usize = 1 << 4;
 const ACTION_COUNT: usize = 1 << 1;
 fn test_list() {
     println!("Creating list...");
+    let mut token = crate::gc::Owner::new();
     let mut list = List::new();
     for i in 0..=LIST_COUNT {
-        list.push_tail(i);
+        list.push_tail(&mut token, i);
     }
 
     println!("Inserting randomly");
     for i in 0..ACTION_COUNT {
         match self::rand::thread_rng().gen_range(0..=2) {
             //0 => list.get(thread_rng().gen_range(0, list.len)).unlink(&mut list),
-            1 => list.get(self::rand::thread_rng().gen_range(0..=list.len-1)).link_next(Node::new(i), &mut list),
+            1 => list.get(&token, self::rand::thread_rng().gen_range(0..=list.len-1)).link_next(&mut token, Node::new(i), &mut list),
             _ => (),
         }
         Collector::maybe_yuga();
     }
 
     if let Some(head) = list.get_head() {
-        let info = head.get(|n| (n.val, n.next.is_some(), n.prev.is_some()) );
+        let info = head.get(&token, |n| (n.val, n.next.is_some(), n.prev.is_some()) );
         println!("{}, next {} prev {}", info.0, info.1, info.2);
     }
 }
 
 fn mini_list() {
     println!("creating list");
+    let mut token = crate::gc::Owner::new();
     let mut list = List::new();
     for i in 0..3 {
-        list.push_tail(i);
+        list.push_tail(&mut token, i);
     }
     Collector::yuga();
     println!("------------ BUG HERE");
-    let n = list.get(1);
-    n.link_next(Node::new(4), &mut list);
+    let n = list.get(&token, 1);
+    n.link_next(&mut token, Node::new(4), &mut list);
     drop(n);
     println!("------------ BUG END");
     /*let mut curr = list.head;

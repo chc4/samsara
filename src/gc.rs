@@ -328,6 +328,8 @@ impl<T: Trace + 'static> Drop for Gc<T> {
     }
 }
 
+pub type Owner<T> = qcell::TCellOwner<T>;
+
 impl<T: Trace> Gc<T> {
     pub fn new(t: T) -> Self {
         Gc { item: Arc::new((RwLock::new(Some(t)), AtomicUsize::new(GcFlags::NONE.bits()), Tracker::of(&LIVE_COUNT))) }
@@ -355,29 +357,102 @@ impl<T: Trace> Gc<T> {
         Gc { item: Arc::new((RwLock::new(None), AtomicUsize::new(GcFlags::NONE.bits()), Tracker::of(&LIVE_COUNT))) }
     }
 
-    /// Get a read-only view of the contents of the Gc<T> object. This acquires
-    /// and returns the guard for a RwLock read-lock: this means that, if there
-    /// is an outstanding write-lock held, it will block until the write-lock is
-    /// released.
+    /// Get a read-only view of the contents of the Gc<T> object. It takes an
+    /// immutable borrow of an Owner<T> in order to help prevent dead-locks due
+    /// to a thread blocking the get() on an existing set() operation's outstanding
+    /// lock.
     ///
     /// If used in the Drop impl of an object contained within a Gc<T>, this method
     /// may panic due to attempting to dereference a Gc pointer that has been nullified
     /// in order to break cycles - however, in normal operations, it will not panic.
-    pub fn get<F, O>(&self, f: F) -> O where F: Fn(&T) -> O {
+    pub fn get<'a, F, O>(&self, o: &'a Owner<T>, f: F) -> O where F: Fn(&T) -> O {
+        // If the object is interiorally mutable, than the collect will
+        // acquire a write-lock when doing tracing in order to handle
+        // [Moving Reference], meaning try_read() may spuriously fail; we
+        // instead need to degrade to get_blocking.
+        if <Self as Trace>::MUT {
+            return self.get_blocking(f)
+        }
+
+        self.get_operation(|lock| {
+            lock.try_read().unwrap()
+        }, f)
+    }
+
+    /// Get a read-only view of the contents of a Gc<T> object. This method is the
+    /// same as [[Gc::get]], and thus may cause dead-locks if used incorrectly.
+    pub fn get_blocking<F, O>(&self, f: F) -> O where F: Fn(&T) -> O {
+        self.get_operation(|lock| lock.read().unwrap(), f)
+    }
+
+    // Internal get() operation helper
+    fn get_operation<READ, F, O>(&self, read: READ, f: F) -> O where
+        F: Fn(&T) -> O,
+        READ: Fn(&RwLock<Option<T>>) -> RwLockReadGuard<'_, Option<T>>
+    {
         event!(Level::TRACE, "get on 0x{:x}", self.as_ptr() as usize);
         // See [Moving Reference]
         if <Self as Trace>::MUT {
-            //self.visited_to_dirty();
+            self.visited_to_dirty();
         }
-        f(self.item.0.read().unwrap().as_ref().unwrap())
+        f(read(&self.item.0).as_ref().unwrap())
     }
 
-    pub fn set<F, O>(&self, f: F) -> O where F: Fn(&mut T) -> O {
+    /// Get a mutable view of the contents of the Gc<T> object. It takes a
+    /// mutable borrow of an Owner<T> in order to help prevent dead-locks, since
+    /// it is impossible to have two outstanding borrows to an Owner<T>.
+    ///
+    /// This operation may temporarily block on the cycle collector tracing the
+    /// object on another thread.
+    pub fn set<'a, F, O>(&self, o: &'a mut Owner<T>, f: F) -> O where F: Fn(&mut T) -> O {
+        // This is actually just the same as force_set! The extra parameter is
+        // the only difference, but enforces an extra constraint on the caller.
+        self.force_set(f)
+    }
+
+    /// Get a mutable view of the contents of the Gc<T> object. This method is the
+    /// same as [[Gc::set]] except for **not** taking an Owner<T>, and thus may cause
+    /// deadlocks if used incorrectly.
+    pub fn force_set<F, O>(&self, f: F) -> O where F: Fn(&mut T) -> O {
+        self.set_operation(|lock| lock.write().unwrap(), f)
+    }
+
+    // Internal set() operation helper
+    fn set_operation<WRITE, F, O>(&self, write: WRITE, f: F) -> O where
+        F: Fn(&mut T) -> O,
+        WRITE: Fn(&RwLock<Option<T>>) -> RwLockWriteGuard<'_, Option<T>>
+    {
         let mut binding = self.item.0.write().unwrap();
         let locked = binding.as_mut().unwrap();
         // See [Moving Reference]
-        //self.visited_to_dirty();
+        self.visited_to_dirty();
         f(locked)
+    }
+
+    /// Get a mutable view of multiple Gc<T> objects at once. If any of the objects
+    /// are duplicates of each other, returns None. Otherwise, it calls the closure
+    /// with a list of all the objects.
+    pub fn set_multiple<'a, const N: usize, F, O>(o: &'a mut Owner<T>, objects: [&Gc<T>; N], f: F) -> Option<O> where F: Fn([&mut T; N]) -> O {
+        // If they try to acquire a lock on two objects, and the two objects are the
+        // same, it's an error.
+        let mut i = 0;
+        let mut items = objects.map(|n| { i += 1; (i, n) });
+        items.sort_by_key(|n| n.1.as_ptr());
+        if items.windows(2).any(|a| {
+            // Check if any two adjacent elements are the same
+            let [a, b] = a else { return false };
+            a.1.as_ptr() == b.1.as_ptr()
+        }) {
+            return None
+        }
+        // Acquire each item; since they're sorted, and this is the only way to
+        // lock multiple items, this can't deadlock.
+        let mut binding = items.map(|n| (n.0, n.1.item.0.write().unwrap()) );
+        let mut locked = binding.each_mut().map(|i| (i.0, i.1.as_mut().unwrap()) );
+        // ...but it also means that we have to then unsort the items in order to
+        // give them as arguments in the correct order.
+        locked.sort_by_key(|n| n.0);
+        Some(f(locked.map(|i| i.1)))
     }
 
     pub fn as_ptr(&self) -> *const () {

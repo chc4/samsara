@@ -1,3 +1,4 @@
+#![feature(array_methods)]
 mod trace;
 mod gc;
 mod collector;
@@ -5,7 +6,7 @@ mod tracker;
 #[cfg(test)]
 mod test;
 
-pub use gc::{Gc, WeakRoot};
+pub use gc::{Gc, WeakRoot, Owner};
 pub use trace::Trace;
 pub use collector::Collector;
 
