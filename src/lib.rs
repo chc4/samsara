@@ -5,6 +5,10 @@ mod tracker;
 #[cfg(test)]
 mod test;
 
+pub use gc::{Gc, WeakRoot};
+pub use trace::Trace;
+pub use collector::Collector;
+
 pub fn add(left: usize, right: usize) -> usize {
     left + right
 }

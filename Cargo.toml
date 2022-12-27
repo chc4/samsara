@@ -27,3 +27,9 @@ loom = "0.5"
 env_logger = "*"
 tracing-subscriber = {version = "0.3", default-features = false, features = ["env-filter", "fmt"]}
 test-log = { version = "0.2.11", features = ["trace"]}
+
+[workspace]
+members = [
+    ".",
+    "bench",
+]
