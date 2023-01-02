@@ -158,3 +158,5 @@ fn main() {
     assert_eq!(crate::gc::number_of_live_objects(), 0);
 }
 ```
+
+[qcell]: https://crates.io/crates/qcell
