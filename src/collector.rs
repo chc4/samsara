@@ -420,16 +420,23 @@ impl<'a> Collector<'a> {
         })
     }
 
-    /// Trigger a cycle collection.
-    pub fn yuga() {
+    /// Trigger a cycle collection, optionally blocking for completion.
+    pub fn yuga(wait: bool) {
         let b = Arc::new((Mutex::new(false), Condvar::new()));
         let _force = span!(Level::DEBUG, "Mutator forcing collection");
         let _force_scope = _force.enter();
         LOCAL_SENDER.with(|l| l.chan.borrow().as_ref().unwrap().send(Soul::Yuga(b.clone())) ).unwrap();
 
-        // wait for the yuga to end
-        let mut lock = b.0.lock().unwrap();
-        while !*lock { lock = b.1.wait(lock).unwrap(); }
+        if wait {
+            // wait for the yuga to end
+            let mut lock = b.0.lock().unwrap();
+            while !*lock { lock = b.1.wait(lock).unwrap(); }
+        }
+    }
+
+    /// Trigger a non-blocking cycle collection.
+    pub fn trigger() {
+        Self::yuga(false);
     }
 
     //#[cfg(all(feature = "shuttle", test))]
@@ -437,13 +444,7 @@ impl<'a> Collector<'a> {
     pub fn maybe_yuga() {
         use self::rand::Rng;
         if self::rand::thread_rng().gen::<bool>() == false { return ; }
-        let _force = span!(Level::DEBUG, "Mutator forcing non-blocking collection");
-        let _force_scope = _force.enter();
-        let b = Arc::new((Mutex::new(false), Condvar::new()));
-        LOCAL_SENDER.with(|l| l.chan.borrow().as_ref().unwrap().send(Soul::Yuga(b.clone())) ).unwrap();
-
-        // wait for the yuga to end
-        event!(Level::TRACE, "skipping wait");
+        Self::yuga(false);
     }
 }
 

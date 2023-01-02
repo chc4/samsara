@@ -85,13 +85,14 @@ mod tests {
         println!("3");
         drop(foo);
         println!("4");
-        Collector::yuga();
+        Collector::maybe_yuga();
         println!("5");
         assert_eq!(bar.get(&token, |i| i.b), 1);
         drop(bar);
         println!("6");
-        Collector::yuga();
+        Collector::yuga(true);
         println!("7");
+        assert_eq!(gc::number_of_live_objects(), 0);
     }
 
     #[test]
@@ -105,13 +106,13 @@ mod tests {
         a3.set(&mut token, |a| a.bar = vec![a1.clone()]);
         println!("1");
         drop(a1);
-        Collector::yuga();
+        Collector::maybe_yuga();
         println!("2");
         drop(a2);
-        Collector::yuga();
+        Collector::maybe_yuga();
         println!("3");
         drop(a3);
-        Collector::yuga();
+        Collector::yuga(true);
         assert_eq!(gc::number_of_live_objects(), 0);
     }
 
@@ -129,7 +130,7 @@ mod tests {
         drop(a2);
         println!("2");
         a3.set(&mut token, |a| {
-            Collector::yuga();
+            Collector::yuga(true);
             drop(a);
         });
     }
@@ -151,7 +152,7 @@ mod tests {
         drop(a3);
         drop(live.clone());
         println!("3");
-        Collector::yuga();
+        Collector::yuga(true);
         println!("4");
         assert_eq!(live.get(&token, |l| l.b), 3);
         assert_eq!(gc::number_of_live_objects(), 1);
@@ -174,7 +175,7 @@ mod tests {
         drop(a3);
         drop(live.clone());
         println!("3");
-        Collector::yuga();
+        Collector::yuga(true);
         println!("4");
         assert_eq!(live.get(&token, |l| l.b), 3);
         assert_eq!(gc::number_of_live_objects(), 1);
@@ -209,11 +210,11 @@ mod tests {
         };
 
         println!("1");
-        Collector::yuga();
+        Collector::yuga(true);
         assert_eq!(gc::number_of_live_objects(), 7);
         println!("2");
         drop(join);
-        Collector::yuga();
+        Collector::yuga(true);
         assert_eq!(gc::number_of_live_objects(), 0);
     }
 
@@ -240,11 +241,11 @@ mod tests {
         };
 
         println!("1");
-        root.get(&root_token, move |r| r.bar[0].set(&mut token, |b| Collector::yuga()));
+        root.get(&root_token, move |r| r.bar[0].set(&mut token, |b| Collector::yuga(true)));
         assert_eq!(gc::number_of_live_objects(), 4);
         println!("2");
         drop(root);
-        Collector::yuga();
+        Collector::yuga(true);
         assert_eq!(gc::number_of_live_objects(), 0);
     }
 
@@ -272,7 +273,7 @@ mod tests {
         drop(a3.clone());
         drop(a4);
         drop(a5);
-        Collector::yuga();
+        Collector::yuga(true);
         assert_eq!(gc::number_of_live_objects(), 6);
     }
 
@@ -283,7 +284,7 @@ mod tests {
         let a1 = new(1);
         a0.set(&mut token, |a|{ a.bar.push(Gc::clone(&a1)); a.bar.push(Gc::clone(&a1)); });
         drop(a1);
-        Collector::yuga();
+        Collector::yuga(true);
         assert_eq!(gc::number_of_live_objects(), 1);
     }
 
@@ -293,8 +294,7 @@ mod tests {
         let a0 = new(0);
         a0.set(&mut token, |a| a.bar.push(Gc::clone(&a0)));
         drop(a0);
-        Collector::yuga();
+        Collector::yuga(true);
         assert_eq!(gc::number_of_live_objects(), 0);
     }
-
 }

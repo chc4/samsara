@@ -29,48 +29,54 @@ const NODE_COUNT: usize = 1 << 6;
 const EDGE_COUNT: usize = 1 << 4;
 const SHRINK_DIV: usize = 1 << 3;
 
+struct Link<T: Send + Sync + 'static>(Gc<Node<T>>);
+// manual impl since derive(Clone) adds an extra T: Clone bound
+impl<T: Send + Sync + 'static> Clone for Link<T> {
+    fn clone(&self) -> Self {
+        Link(self.0.clone())
+    }
+}
 struct Node<T: Send + Sync + 'static> {
     pub val: T,
-    pub next: Option<Gc<Node<T>>>,
-    pub prev: Option<Gc<Node<T>>>,
+    pub next: Option<Link<T>>,
+    pub prev: Option<Link<T>>,
 }
 impl<T: Send + Sync + 'static> Node<T> {
     fn new(val: T) -> Self {
         Node { val, next: None, prev: None }
     }
-
 }
 
-impl<T: Send + Sync + 'static> Gc<Node<T>> {
+impl<T: Send + Sync + 'static> Link<T> {
     /// Set node to the next link in the list containing self
     fn link_next(&self, token: &mut Owner<Node<T>>, mut node: Node<T>, list: &mut List<T>) {
-        let node = if let Some(curr_next) = self.get(token, |s| s.next.clone() ) {
-            assert!(curr_next.as_ptr() != self.as_ptr(), "self-reference");
+        let node = if let Some(curr_next) = self.0.get(token, |s| s.next.clone() ) {
+            assert!(curr_next.0.as_ptr() != self.0.as_ptr(), "self-reference");
             node.next = Some(curr_next.clone());
             node.prev = Some(self.clone());
 
             let mut node = Gc::new(node);
-            curr_next.set(token, |n| n.prev = Some(node.clone()) );
+            curr_next.0.set(token, |n| n.prev = Some(Link(node.clone())) );
             node
         } else {
             Gc::new(node)
         };
-        self.set(token, |s| s.next = Some(node.clone()));
+        self.0.set(token, |s| s.next = Some(Link(node.clone())));
         list.len += 1;
     }
 
     fn unlink(&self, token: &mut Owner<Node<T>>, list: &mut List<T>) {
-        let (curr_next, curr_prev) = self.get(token, |s| (s.next.clone(), s.prev.clone()) );
+        let (curr_next, curr_prev) = self.0.get(token, |s| (s.next.clone(), s.prev.clone()) );
         // TODO: do we want a set_two that sorts locks+tries to acquire both, for coherency?
-        curr_next.as_ref().map(|c| c.set(token, |c| c.prev = curr_prev.clone()));
-        curr_prev.as_ref().map(|c| c.set(token, |c| c.next = curr_next.clone()));
+        curr_next.as_ref().map(|c| c.0.set(token, |c| c.prev = curr_prev.clone()));
+        curr_prev.as_ref().map(|c| c.0.set(token, |c| c.next = curr_next.clone()));
         if let Some(list_head) = list.head.clone() {
-            if list_head.as_ptr() == self.as_ptr() {
+            if list_head.0.as_ptr() == self.0.as_ptr() {
                 list.head = curr_next.clone();
             }
         }
         if let Some(list_tail) = list.tail.clone() {
-            if list_tail.as_ptr() == self.as_ptr() {
+            if list_tail.0.as_ptr() == self.0.as_ptr() {
                 list.tail = curr_prev;
             }
         }
@@ -80,8 +86,8 @@ impl<T: Send + Sync + 'static> Gc<Node<T>> {
 
 
 struct List<T: Send + Sync + 'static> {
-    head: Option<Gc<Node<T>>>,
-    tail: Option<Gc<Node<T>>>,
+    head: Option<Link<T>>,
+    tail: Option<Link<T>>,
     len: usize,
 }
 impl<T: Send + Sync + 'static> List<T> {
@@ -94,11 +100,11 @@ impl<T: Send + Sync + 'static> List<T> {
         node.next = self.head.clone();
 
         let new_head = Gc::new(node);
-        self.head.as_ref().map(|head| head.set(token, |i| i.prev = Some(new_head.clone()) ));
+        self.head.as_ref().map(|head| head.0.set(token, |i| i.prev = Some(Link(new_head.clone())) ));
         if let None = self.tail {
-            self.tail = Some(new_head.clone());
+            self.tail = Some(Link(new_head.clone()));
         }
-        self.head = Some(new_head);
+        self.head = Some(Link(new_head));
         self.len += 1;
     }
 
@@ -106,22 +112,22 @@ impl<T: Send + Sync + 'static> List<T> {
         let mut node = Node::new(val);
         node.prev = self.tail.clone();
         let new_tail = Gc::new(node);
-        self.tail.as_ref().map(|tail| tail.set(token, |i| i.next = Some(new_tail.clone()) ));
+        self.tail.as_ref().map(|tail| tail.0.set(token, |i| i.next = Some(Link(new_tail.clone())) ));
         if let None = self.head {
-            self.head = Some(new_tail.clone());
+            self.head = Some(Link(new_tail.clone()));
         }
-        self.tail = Some(new_tail);
+        self.tail = Some(Link(new_tail));
         self.len += 1;
     }
 
-    fn get_head(&self) -> Option<Gc<Node<T>>> {
+    fn get_head(&self) -> Option<Link<T>> {
         self.head.clone()
     }
 
-    fn get(&self, token: &Owner<Node<T>>, i: usize) -> Gc<Node<T>> {
+    fn get(&self, token: &Owner<Node<T>>, i: usize) -> Link<T> {
         let mut head = self.head.clone();
         for _ in 0..i {
-            head = head.unwrap().get(token, |c| c.next.clone());
+            head = head.unwrap().0.get(token, |c| c.next.clone());
         }
         head.unwrap()
     }
@@ -129,15 +135,15 @@ impl<T: Send + Sync + 'static> List<T> {
 
 impl<T: Send + Sync + 'static> Trace for Node<T> {
     fn trace(&self, root: &WeakRoot, c: &mut crate::collector::Collector) {
-        self.next.as_ref().map(|n| n.trace(root, c));
-        self.prev.as_ref().map(|p| p.trace(root, c));
+        self.next.as_ref().map(|n| n.0.trace(root, c));
+        self.prev.as_ref().map(|p| p.0.trace(root, c));
     }
 }
 
 impl<T: Send + Sync + 'static> Trace for List<T> {
     fn trace(&self, root: &WeakRoot, c: &mut crate::collector::Collector) {
-        self.head.as_ref().map(|n| n.trace(root, c));
-        self.tail.as_ref().map(|p| p.trace(root, c));
+        self.head.as_ref().map(|n| n.0.trace(root, c));
+        self.tail.as_ref().map(|p| p.0.trace(root, c));
     }
 }
 
@@ -211,7 +217,7 @@ fn test_list() {
     }
 
     if let Some(head) = list.get_head() {
-        let info = head.get(&token, |n| (n.val, n.next.is_some(), n.prev.is_some()) );
+        let info = head.0.get(&token, |n| (n.val, n.next.is_some(), n.prev.is_some()) );
         println!("{}, next {} prev {}", info.0, info.1, info.2);
     }
 }
@@ -223,7 +229,7 @@ fn mini_list() {
     for i in 0..3 {
         list.push_tail(&mut token, i);
     }
-    Collector::yuga();
+    Collector::maybe_yuga();
     println!("------------ BUG HERE");
     let n = list.get(&token, 1);
     n.link_next(&mut token, Node::new(4), &mut list);
@@ -248,7 +254,24 @@ mod test {
     #[self::test]
     fn normal_test_list() {
         test_list();
-        Collector::yuga();
+        Collector::yuga(true);
+        assert_eq!(crate::gc::number_of_live_objects(), 0);
+    }
+
+    #[self::test]
+    fn test_list_leaking() {
+        let mut token = crate::gc::Owner::new();
+        // create a double-linked list of numbers...
+        let mut list = List::new();
+        list.push_tail(&mut token, 1);
+        list.push_tail(&mut token, 2);
+        list.push_tail(&mut token, 3);
+        assert_eq!(crate::gc::number_of_live_objects(), 3);
+        drop(list); // drop the list
+        // oh no, the refcount cycles are causing memory to leak!
+        assert_eq!(crate::gc::number_of_live_objects(), 3);
+        Collector::yuga(true); // trigger a collection, blocking on completion
+        // yay, all the unreachable objects were freed!
         assert_eq!(crate::gc::number_of_live_objects(), 0);
     }
 }
@@ -278,7 +301,7 @@ mod test {
     fn shuttle_test_mini() {
         random(|| {
             mini_list();
-            Collector::yuga();
+            Collector::yuga(true);
             assert_eq!(crate::gc::number_of_live_objects(), 0);
         }, 100);
     }
@@ -287,7 +310,7 @@ mod test {
     fn shuttle_test_list() {
         random(|| {
             test_list();
-            Collector::yuga();
+            Collector::yuga(true);
             assert_eq!(crate::gc::number_of_live_objects(), 0);
         }, 100);
     }
@@ -296,7 +319,7 @@ mod test {
     fn shuttle_fail_list() {
         shuttle::replay(|| {
             test_list();
-            Collector::yuga();
+            Collector::yuga(true);
             assert_eq!(crate::gc::number_of_live_objects(), 0);
         }, "91019004a4b98099e9c7b29a59008a00000080000000020000200000200000000800000200000002008000000008000008000008000020000000020000020000080000f0170150401544510411551410040000155054044114010005554414111445220008aa08a228a28aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00");
     }
@@ -305,7 +328,7 @@ mod test {
     fn shuttle_test_graph() {
         shuttle::check_random(|| {
             test_graph();
-            Collector::yuga();
+            Collector::yuga(true);
             assert_eq!(crate::gc::number_of_live_objects(), 0);
         }, 100);
     }

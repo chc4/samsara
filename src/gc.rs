@@ -428,7 +428,18 @@ impl<T: Trace> Gc<T> {
     /// Get a mutable view of multiple Gc<T> objects at once. If any of the objects
     /// are duplicates of each other, returns None. Otherwise, it calls the closure
     /// with a list of all the objects.
-    pub fn set_multiple<'a, const N: usize, F, O>(o: &'a mut Owner<T>, objects: [&Gc<T>; N], f: F) -> Option<O> where F: Fn([&mut T; N]) -> O {
+    pub fn set_multiple<'a, const N: usize, F, O>(o: &'a mut Owner<T>, objects: [&Gc<T>; N], f: F) -> Option<O> where F: FnOnce([&mut T; N]) -> O {
+        // This is actually just the same as force_set_multiple! The extra parameter is
+        // the only difference, but enforces an extra constraint on the caller.
+        Self::force_set_multiple(objects, f)
+    }
+
+    /// Get a mutable view of multiple Gc<T> objects at once. This is the same as
+    /// [[Gc::set_multiple]] except for **not** taking an Owner<T>, and thus may cause
+    /// deadlocks if used incorrectly; it does however always take the locks of all
+    /// the objects in a sorted, and thus totally-ordered, manner, which should
+    /// cause two threads force_set_multiple's to not deadlock on eachother.
+    pub fn force_set_multiple<'a, const N: usize, F, O>(objects: [&Gc<T>; N], f: F) -> Option<O> where F: FnOnce([&mut T; N]) -> O {
         // If they try to acquire a lock on two objects, and the two objects are the
         // same, it's an error.
         let mut i = 0;
