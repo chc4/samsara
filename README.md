@@ -1,6 +1,6 @@
 # Samsara
 
-Samsara is a Rust library that provides a `Gc<T>` reference-counted cycle collected smartpointer. You can use it as a mostly drop-in replacement for `Arc<RefCell<T>>`, except that calling `samsara::Collector::trigger()` will find and free any objects that are leaking memory due to cyclic references - this cycle collection is done by another thread concurrently with any mutators, and has no global stop-the-world phase.
+Samsara is a Rust library that provides a `Gc<T>` reference-counted cycle collected smartpointer. You can use it as a mostly drop-in replacement for `Rc<RefCell<T>>` or `Arc<RwLock<T>>`, except that calling `samsara::Collector::trigger()` will find and free any objects that are leaking memory due to cyclic references - this cycle collection is done by another thread concurrently with any mutators, and has no global stop-the-world phase.
 
 Samsara is written in safe Rust, implemented over the `Arc<T>` type. Even if it incorrectly destroys objects that were in fact reachable (which it should not; if it does, report it as a bug please!) it will only cause panics via an `Option::unwrap`, not a use-after-free. It doesn't require any manual root object tracking like other garbage collector crates.
 
@@ -11,7 +11,7 @@ Cycle collection itself is currently *only* manually triggered, and doesn't run 
 Additionally, while Samsara doesn't have a *global* stop-the-world phase, it may temporarily cause mutator threads to block on acquiring a mutable reference to an object, if that object was in the process of being scanned by the collector thread - this should be short, with the lock only held for as long as it takes to visit that individual object and not the entire subgraph. Additionally, if the object has any interior mutable fields that aren't other `Gc<T>` handles, then acquiring *non-mut* reference to an object will also potentially block.
 
 # Usage
-`Gc<T>` has two APIs: `get` and `set` take an `Owner<T>` type as a parameter, which is a re-export of [qcell]'s `TCellOwner<T>` type. This allows for a static guarantee that access the `Gc<T>` potentially across different threads won't deadlock, since only one thread can have ownership of the owner singleton type at a time - you can optionally put the `Owner<T>` value in a normal `Arc<RefCell<T>>` to gain normal RefCell-like panic-on-double-get_mut semantics on acquiring the owner value.
+`Gc<T>` has two APIs: `get` and `set` take an `Owner<T>` type as a parameter, which is a re-export of [qcell]'s `TCellOwner<T>` type. This allows for a static guarantee that access the `Gc<T>` potentially across different threads won't deadlock, since it enforces mutable borrows of the owner singleton type must be disjoint with other accesses at compile time - you can optionally put the `Owner<T>` value in a normal synchronization primitive like `Rc<RefCell<T>>` or `Arc<Mutex<T>>` to gain normal runtime-borrowchecking semantics on acquiring the owner value.
 
 It also provides `get_blocking` and `force_set` functions, which are the same but don't take an `Owner<T>` as a parameter. They have `Arc<RwLock<T>>` semantics, where attempting to `force_set` on an object with outstanding `get` or `get_blocking` calls may block or cause a deadlock, and vice-versa.
 
